@@ -187,7 +187,7 @@ impl WaveletApp {
 
         ui.label("ω₀ (Morlet):");
         changed |= ui.add(
-            egui::Slider::new(&mut self.params.omega0, 4.0..=28.0).text("ω₀"),
+            egui::Slider::new(&mut self.params.omega0, 4.0..=40.0).text("ω₀"),
         ).changed();
 
         ui.label("Scales:");
