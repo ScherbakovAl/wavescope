@@ -9,6 +9,38 @@ use crate::cuda::{
 use crate::wavelet::CwtParams;
 
 // ---------------------------------------------------------------------------
+// Zero-phase IIR anti-aliasing low-pass filter
+// ---------------------------------------------------------------------------
+
+/// Applies `order` forward + `order` backward passes of a single-pole IIR
+/// low-pass filter, giving zero phase distortion and ~6*2*order dB/oct rolloff.
+/// `cutoff_hz` is the -3 dB point; `sample_rate` is the signal's sample rate.
+fn lowpass_zero_phase(signal: &[f32], cutoff_hz: f64, sample_rate: f64, order: usize) -> Vec<f32> {
+    let cn    = cutoff_hz / sample_rate;          // normalized cutoff ∈ (0, 0.5)
+    let alpha = (-2.0 * PI * cn).exp() as f32;   // pole location
+    let k     = 1.0 - alpha;                      // DC gain correction
+
+    let mut buf = signal.to_vec();
+
+    for _ in 0..order {
+        // Forward pass
+        let mut s = buf[0];
+        for x in buf.iter_mut() {
+            s   = alpha * s + k * *x;
+            *x  = s;
+        }
+        // Backward pass (cancels phase shift)
+        let mut s = *buf.last().unwrap();
+        for x in buf.iter_mut().rev() {
+            s   = alpha * s + k * *x;
+            *x  = s;
+        }
+    }
+
+    buf
+}
+
+// ---------------------------------------------------------------------------
 // CWT engine
 // ---------------------------------------------------------------------------
 
@@ -47,6 +79,7 @@ impl CwtEngine {
         t_end:       usize,
         width_pixels: usize,
         params:      &CwtParams,
+        antialias:   bool,
     ) -> anyhow::Result<Vec<f32>> {
         let total     = signal.len();
         let t_start   = t_start.min(total);
@@ -81,10 +114,22 @@ impl CwtEngine {
         let seg_end   = (t_end + padding).min(total);
         let pre_pad   = t_start - seg_start;   // samples before t_start in segment
 
-        let segment_ds: Vec<f32> = signal[seg_start..seg_end]
-            .chunks(d)
-            .map(|c| c.iter().sum::<f32>() / c.len() as f32)
-            .collect();
+        // Anti-aliasing: low-pass filter at 90 % of the downsampled Nyquist
+        // before decimation to prevent frequencies above f_ds/2 from folding back.
+        let segment_ds: Vec<f32> = if antialias && d > 1 {
+            let cutoff = sample_rate as f64 / (2.0 * d as f64) * 0.9;
+            let filtered = lowpass_zero_phase(
+                &signal[seg_start..seg_end], cutoff, sample_rate as f64, 4,
+            );
+            filtered.chunks(d)
+                .map(|c| c.iter().sum::<f32>() / c.len() as f32)
+                .collect()
+        } else {
+            signal[seg_start..seg_end]
+                .chunks(d)
+                .map(|c| c.iter().sum::<f32>() / c.len() as f32)
+                .collect()
+        };
 
         let seg_ds_len   = segment_ds.len();
         let valid_start  = (pre_pad / d).min(seg_ds_len);

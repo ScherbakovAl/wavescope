@@ -25,6 +25,7 @@ pub struct ComputeRequest {
     pub t_end:        usize,
     pub width_pixels: usize,
     pub params:       CwtParams,
+    pub antialias:    bool,
 }
 
 pub enum WorkerResult {
@@ -61,6 +62,7 @@ pub struct WaveletApp {
     params:     CwtParams,
     colormap:   ColorMap,
     log_scale:  bool,
+    antialias:  bool,
 
     // Worker thread communication
     work_tx:    mpsc::SyncSender<WorkerMsg>,
@@ -91,6 +93,7 @@ impl WaveletApp {
             params:          CwtParams::default(),
             colormap:        ColorMap::Plasma,
             log_scale:       true,
+            antialias:       true,
             work_tx,
             result_rx:       res_rx,
             computing:       false,
@@ -117,6 +120,7 @@ impl WaveletApp {
             t_end:        t1,
             width_pixels: width_px,
             params:       self.params.clone(),
+            antialias:    self.antialias,
         };
         let _ = self.work_tx.try_send(WorkerMsg::Compute(req));
         self.computing       = true;
@@ -128,10 +132,12 @@ impl WaveletApp {
     // Rebuild egui textures from scalogram data
     // -----------------------------------------------------------------------
     fn rebuild_textures(&mut self, ctx: &egui::Context) {
-        let width      = self.scalogram_width;
-        let num_scales = self.params.num_scales;
+        let width = self.scalogram_width;
         self.textures.clear();
+        if width == 0 { return; }
         for sc in &self.scalograms {
+            let num_scales = sc.len() / width;
+            if num_scales == 0 { continue; }
             let rgba = scalogram_to_rgba(sc, width, num_scales, self.colormap, self.log_scale);
             let img  = egui::ColorImage::from_rgba_unmultiplied([width, num_scales], &rgba);
             let tex  = ctx.load_texture("scalogram", img, egui::TextureOptions::LINEAR);
@@ -181,29 +187,35 @@ impl WaveletApp {
 
         ui.label("ω₀ (Morlet):");
         changed |= ui.add(
-            egui::Slider::new(&mut self.params.omega0, 4.0..=12.0).text("ω₀"),
+            egui::Slider::new(&mut self.params.omega0, 4.0..=28.0).text("ω₀"),
         ).changed();
 
         ui.label("Scales:");
         let mut ns = self.params.num_scales as u32;
-        if ui.add(egui::Slider::new(&mut ns, 64..=512).text("n")).changed() {
+        if ui.add(egui::Slider::new(&mut ns, 64..=2048).logarithmic(true).text("n")).changed() {
             self.params.num_scales = ns as usize;
             changed = true;
         }
 
         ui.label("f min (Hz):");
-        changed |= ui.add(
-            egui::Slider::new(&mut self.params.f_min, 1.0..=1000.0)
+        if ui.add(
+            egui::Slider::new(&mut self.params.f_min, 1.0..=22050.0)
                 .logarithmic(true)
                 .text("Hz"),
-        ).changed();
+        ).changed() {
+            self.params.f_min = self.params.f_min.min(self.params.f_max * 0.99);
+            changed = true;
+        }
 
         ui.label("f max (Hz):");
-        changed |= ui.add(
-            egui::Slider::new(&mut self.params.f_max, 500.0..=22050.0)
+        if ui.add(
+            egui::Slider::new(&mut self.params.f_max, 1.0..=22050.0)
                 .logarithmic(true)
                 .text("Hz"),
-        ).changed();
+        ).changed() {
+            self.params.f_max = self.params.f_max.max(self.params.f_min * 1.01);
+            changed = true;
+        }
 
         ui.separator();
         ui.heading("Display");
@@ -225,6 +237,16 @@ impl WaveletApp {
         if ui.checkbox(&mut self.log_scale, "Log amplitude").changed() {
             let w = self.scalogram_width;
             if w > 0 { self.rebuild_textures(ctx); }
+        }
+
+        if ui.checkbox(&mut self.antialias, "Anti-aliasing filter").changed()
+            && self.audio.is_some()
+        {
+            if self.computing {
+                self.pending_compute = true;
+            } else {
+                self.trigger_compute(self.last_width_px);
+            }
         }
 
         ui.separator();
@@ -614,6 +636,7 @@ fn worker_thread(
                         req.t_end,
                         req.width_pixels,
                         &req.params,
+                        req.antialias,
                     ) {
                         Ok(s)  => results.push(s),
                         Err(e) => { err = Some(e.to_string()); break; }

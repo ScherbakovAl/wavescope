@@ -3,7 +3,8 @@
     "allow": [
       "Bash(cargo build:*)",
       "Bash(cargo doc:*)",
-      "Read(//home/sche/.cargo/registry/src/**)"
+      "Read(//home/sche/.cargo/registry/src/**)",
+      "Bash(cargo check:*)"
     ]
   }
 }
