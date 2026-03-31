@@ -60,8 +60,12 @@ impl CwtEngine {
         let visible_samples = t_end - t_start;
 
         // ---- downsampling factor -----------------------------------------
-        // One pixel should represent at most this many original samples.
-        let d = (visible_samples / width_pixels).max(1);
+        // One pixel should represent at most this many original samples,
+        // but we must preserve enough bandwidth to resolve f_max (Nyquist).
+        let max_d_for_fmax = ((sample_rate as f64) / (2.0 * params.f_max as f64))
+            .floor()
+            .max(1.0) as usize;
+        let d = (visible_samples / width_pixels).max(1).min(max_d_for_fmax);
         let f_ds = sample_rate as f64 / d as f64;   // effective sample rate
 
         // ---- padding (half wavelet support at the lowest frequency) -------
