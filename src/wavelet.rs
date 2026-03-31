@@ -29,7 +29,7 @@ pub struct CwtParams {
 impl Default for CwtParams {
     fn default() -> Self {
         Self {
-            num_scales: 256,
+            num_scales: 128,
             f_min: 20.0,
             f_max: 20_000.0,
             omega0: 6.0,

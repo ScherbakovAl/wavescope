@@ -155,7 +155,7 @@ impl WaveletApp {
         // File open
         if ui.button("📂 Open file…").clicked() {
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Audio", &["wav", "flac", "wave"])
+                .add_filter("Audio", &["wav", "WAV", "wave", "WAVE", "flac", "FLAC"])
                 .pick_file()
             {
                 let _ = self.work_tx.try_send(WorkerMsg::LoadFile {
