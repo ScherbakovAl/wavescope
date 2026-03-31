@@ -239,10 +239,10 @@ impl WaveletApp {
 
         ui.separator();
         ui.label("Interactions:");
-        ui.label("Scroll        – zoom time axis");
-        ui.label("Ctrl+Scroll   – zoom freq axis");
-        ui.label("Drag          – pan");
-        ui.label("Right-click   – reset view");
+        ui.label("Scroll         – zoom time axis");
+        ui.label("Shift+Scroll   – zoom freq axis");
+        ui.label("Drag           – pan");
+        ui.label("Right-click    – reset view");
 
         // Status / spinner at bottom
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -378,16 +378,18 @@ impl WaveletApp {
                     );
                 }
 
-                // Scroll: zoom time or frequency
+                // Scroll: zoom time (plain) or frequency (Shift+scroll).
+                // NOTE: egui-winit converts Ctrl+Scroll into zoom_delta and
+                // zeros out scroll_delta, so we use Shift for freq zoom.
                 if response.hovered() {
-                    let (scroll, ctrl) =
-                        ctx.input(|i| (i.smooth_scroll_delta, i.modifiers.ctrl));
+                    let (scroll, shift) =
+                        ctx.input(|i| (i.raw_scroll_delta, i.modifiers.shift));
 
                     if scroll.y.abs() > 0.5 {
                         let zoom = if scroll.y > 0.0 { 0.85f64 } else { 1.0 / 0.85 };
 
-                        if ctrl {
-                            // Zoom frequency axis (log space)
+                        if shift {
+                            // Zoom frequency axis (log space) around cursor
                             let ry = response
                                 .hover_pos()
                                 .map(|p| {
@@ -403,7 +405,7 @@ impl WaveletApp {
                             new_f_max = (new_hi.exp() as f32).clamp(1.0, 22_050.0);
                             if new_f_min >= new_f_max { new_f_min = new_f_max * 0.5; }
                         } else {
-                            // Zoom time axis
+                            // Zoom time axis around cursor
                             let rx = response
                                 .hover_pos()
                                 .map(|p| {
@@ -417,7 +419,6 @@ impl WaveletApp {
                             new_viewport.t_end =
                                 (cur + (new_viewport.t_end - cur) * zoom)
                                     .min(total_samp as f64);
-                            // Enforce minimum window (8 samples)
                             if new_viewport.t_end - new_viewport.t_start < 8.0 {
                                 new_viewport.t_end = new_viewport.t_start + 8.0;
                             }
@@ -426,20 +427,27 @@ impl WaveletApp {
                     }
                 }
 
-                // Drag: pan time axis
+                // Drag: pan time axis.
+                // FIX: apply delta to self.viewport each frame so that the
+                // accumulated pan is not lost between frames.
                 if response.dragged_by(egui::PointerButton::Primary) {
                     let delta = response.drag_delta();
-                    let len   = new_viewport.t_end - new_viewport.t_start;
-                    let dt    = -(delta.x as f64 / rect.width() as f64) * len;
-                    new_viewport.t_start = (new_viewport.t_start + dt).max(0.0);
-                    new_viewport.t_end   = new_viewport.t_start + len;
-                    if new_viewport.t_end > total_samp as f64 {
-                        new_viewport.t_end   = total_samp as f64;
-                        new_viewport.t_start = new_viewport.t_end - len;
+                    // Use current self.viewport (already committed) as base
+                    let len = self.viewport.t_end - self.viewport.t_start;
+                    let dt  = -(delta.x as f64 / rect.width() as f64) * len;
+                    let mut ts = (self.viewport.t_start + dt).max(0.0);
+                    let mut te = ts + len;
+                    if te > total_samp as f64 {
+                        te = total_samp as f64;
+                        ts = (te - len).max(0.0);
                     }
+                    self.viewport.t_start = ts;
+                    self.viewport.t_end   = te;
+                    new_viewport = self.viewport.clone();
+                    // Repaint so labels follow cursor; recompute on release
                 }
 
-                // Drag released → trigger recompute with panned view
+                // Drag released → trigger recompute with final panned view
                 if response.drag_stopped() {
                     viewport_changed = true;
                 }
