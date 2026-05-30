@@ -1,18 +1,3 @@
-/// Trait for wavelet families (extensibility point for future wavelets).
-pub trait WaveletKernel: Send + Sync {
-    fn name(&self) -> &str;
-    fn omega0(&self) -> f32;
-}
-
-pub struct MorletWavelet {
-    pub omega0: f32,
-}
-
-impl WaveletKernel for MorletWavelet {
-    fn name(&self) -> &str { "Morlet" }
-    fn omega0(&self) -> f32 { self.omega0 }
-}
-
 /// Parameters for the CWT computation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CwtParams {
