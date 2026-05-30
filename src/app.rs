@@ -46,6 +46,15 @@ pub struct Viewport {
     pub t_end:   f64,   // visible window end   in sample indices
 }
 
+// What the user is currently dragging on the time scrollbar.
+#[derive(Clone, Copy, PartialEq)]
+enum ScrollbarDrag {
+    None,
+    Pan,         // move the window (body grabbed)
+    ResizeLeft,  // change zoom by moving the left edge
+    ResizeRight, // change zoom by moving the right edge
+}
+
 // ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
@@ -65,6 +74,7 @@ pub struct WaveletApp {
     tex_viewport: Viewport,         // window the current texture was computed for
     pending_compute_viewport: Viewport, // window of the in-flight compute
     panning:      bool,             // smooth pan in progress (drag + its recompute)
+    scrollbar_drag: ScrollbarDrag,  // active time-scrollbar interaction
     params:       CwtParams,
     colormap:     ColorMap,
     display_mode: DisplayMode,
@@ -106,6 +116,7 @@ impl WaveletApp {
             tex_viewport:    Viewport { t_start: 0.0, t_end: 1.0 },
             pending_compute_viewport: Viewport { t_start: 0.0, t_end: 1.0 },
             panning:         false,
+            scrollbar_drag:  ScrollbarDrag::None,
             params:          CwtParams::default(),
             colormap:        ColorMap::Plasma,
             display_mode:    DisplayMode::Amplitude,
@@ -420,7 +431,11 @@ impl WaveletApp {
         let f_min        = self.params.f_min as f64;
         let f_max        = self.params.f_max as f64;
 
-        let ch_height = ((available.y / num_ch.max(1) as f32) - 30.0).max(80.0);
+        // Reserve room at the bottom for the time scrollbar (height + spacing)
+        // so it stays inside the window below the scalograms.
+        let scrollbar_room = 44.0;
+        let ch_height =
+            (((available.y - scrollbar_room) / num_ch.max(1) as f32) - 30.0).max(80.0);
 
         self.hover_info = None;
         let mut viewport_changed = false;
@@ -495,8 +510,10 @@ impl WaveletApp {
                 );
             }
 
-            // --- Interaction (use ch==0 viewport for all channels) ---
-            if ch == 0 {
+            // --- Interaction: handled per-channel (each has its own rect /
+            // response), so pan/zoom works on whichever graph is under the
+            // cursor. They all share the same time viewport / freq range. ---
+            {
                 // Hover: crosshair + info
                 if let Some(pos) = response.hover_pos() {
                     let rx = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0) as f64;
@@ -620,6 +637,12 @@ impl WaveletApp {
             });
         }
 
+        // Time scrollbar (position + zoom of the visible window over the file)
+        if self.show_time_scrollbar(ui, total_samp as f64) {
+            new_viewport     = self.viewport.clone();
+            viewport_changed = true;
+        }
+
         // Apply viewport / freq-range updates
         if viewport_changed {
             self.viewport      = new_viewport;
@@ -631,6 +654,126 @@ impl WaveletApp {
                 self.trigger_compute(render_width);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Horizontal time scrollbar.
+    // The track spans the whole file; the thumb's position and width show the
+    // visible window's position and zoom. Drag the body to pan, drag an edge
+    // to zoom. Returns true on release → caller triggers a recompute.
+    // -----------------------------------------------------------------------
+    fn show_time_scrollbar(&mut self, ui: &mut egui::Ui, total_samp: f64) -> bool {
+        let total = total_samp.max(1.0);
+        ui.add_space(4.0);
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 16.0),
+            egui::Sense::click_and_drag(),
+        );
+
+        // Thumb geometry from the current viewport
+        let frac0 = (self.viewport.t_start / total).clamp(0.0, 1.0) as f32;
+        let frac1 = (self.viewport.t_end   / total).clamp(0.0, 1.0) as f32;
+        let x0 = rect.min.x + frac0 * rect.width();
+        let x1 = (rect.min.x + frac1 * rect.width()).max(x0 + 6.0);
+        let thumb = egui::Rect::from_min_max(
+            egui::pos2(x0, rect.min.y),
+            egui::pos2(x1, rect.max.y),
+        );
+        let edge = 6.0_f32;
+
+        // Draw track + thumb
+        let active = self.scrollbar_drag != ScrollbarDrag::None;
+        let thumb_color = if active || response.hovered() {
+            egui::Color32::from_gray(160)
+        } else {
+            egui::Color32::from_gray(110)
+        };
+        let p = ui.painter();
+        p.rect_filled(rect, 4.0, egui::Color32::from_gray(40));
+        p.rect_filled(thumb, 4.0, thumb_color);
+        for gx in [thumb.min.x + 3.0, thumb.max.x - 3.0] {
+            p.line_segment(
+                [egui::pos2(gx, thumb.min.y + 3.0), egui::pos2(gx, thumb.max.y - 3.0)],
+                egui::Stroke::new(1.5, egui::Color32::from_gray(210)),
+            );
+        }
+
+        // Decide drag mode on press (and jump-center when clicking the track)
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if (pos.x - thumb.min.x).abs() <= edge {
+                    self.scrollbar_drag = ScrollbarDrag::ResizeLeft;
+                } else if (pos.x - thumb.max.x).abs() <= edge {
+                    self.scrollbar_drag = ScrollbarDrag::ResizeRight;
+                } else if pos.x >= thumb.min.x && pos.x <= thumb.max.x {
+                    self.scrollbar_drag = ScrollbarDrag::Pan;
+                } else {
+                    // Click on the track outside the thumb → center the window here
+                    self.scrollbar_drag = ScrollbarDrag::Pan;
+                    let len    = self.viewport.t_end - self.viewport.t_start;
+                    let center = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0) as f64 * total;
+                    let mut ts = (center - len / 2.0).max(0.0);
+                    let mut te = ts + len;
+                    if te > total { te = total; ts = (te - len).max(0.0); }
+                    self.viewport.t_start = ts;
+                    self.viewport.t_end   = te;
+                    self.panning = true;
+                }
+            }
+        }
+
+        // Live drag
+        if response.dragged() && self.scrollbar_drag != ScrollbarDrag::None {
+            let dt      = response.drag_delta().x as f64 / rect.width() as f64 * total;
+            let min_len = 8.0;
+            match self.scrollbar_drag {
+                ScrollbarDrag::Pan => {
+                    let len    = self.viewport.t_end - self.viewport.t_start;
+                    let mut ts = (self.viewport.t_start + dt).max(0.0);
+                    let mut te = ts + len;
+                    if te > total { te = total; ts = (te - len).max(0.0); }
+                    self.viewport.t_start = ts;
+                    self.viewport.t_end   = te;
+                    self.panning = true;
+                }
+                ScrollbarDrag::ResizeLeft => {
+                    let mut ts = (self.viewport.t_start + dt).max(0.0);
+                    if ts > self.viewport.t_end - min_len { ts = self.viewport.t_end - min_len; }
+                    self.viewport.t_start = ts;
+                }
+                ScrollbarDrag::ResizeRight => {
+                    let mut te = (self.viewport.t_end + dt).min(total);
+                    if te < self.viewport.t_start + min_len { te = self.viewport.t_start + min_len; }
+                    self.viewport.t_end = te;
+                }
+                ScrollbarDrag::None => {}
+            }
+        }
+
+        // Cursor feedback
+        match self.scrollbar_drag {
+            ScrollbarDrag::Pan =>
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing),
+            ScrollbarDrag::ResizeLeft | ScrollbarDrag::ResizeRight =>
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal),
+            ScrollbarDrag::None => {
+                if let Some(pos) = response.hover_pos() {
+                    if (pos.x - thumb.min.x).abs() <= edge || (pos.x - thumb.max.x).abs() <= edge {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    } else if pos.x >= thumb.min.x && pos.x <= thumb.max.x {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                }
+            }
+        }
+
+        // Release → recompute for the final window
+        if response.drag_stopped() {
+            self.scrollbar_drag = ScrollbarDrag::None;
+            self.panning        = false;
+            return true;
+        }
+        false
     }
 }
 
