@@ -8,6 +8,27 @@ pub enum ColorMap {
     Hot,
 }
 
+/// What the scalogram image shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DisplayMode {
+    /// Amplitude only, via the selected `ColorMap` (default).
+    Amplitude,
+    /// Phase only, via a cyclic hue colour wheel (minimal phase view).
+    Phase,
+    /// Phase as hue, amplitude as brightness (combined domain-colouring view).
+    Combined,
+}
+
+impl DisplayMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            DisplayMode::Amplitude => "Amplitude",
+            DisplayMode::Phase     => "Phase",
+            DisplayMode::Combined  => "Phase+Amplitude",
+        }
+    }
+}
+
 impl ColorMap {
     pub fn name(self) -> &'static str {
         match self {
@@ -102,42 +123,126 @@ const HOT: &[(f32, f32, f32, f32)] = &[
     (1.000, 1.000, 1.000, 1.000),
 ];
 
+/// Logarithmic amplitude compression (monotonic, maps 0 → 0).
+#[inline]
+fn log_compress(v: f32) -> f32 {
+    if v > 0.0 { (v * 1e6 + 1.0).ln() } else { 0.0 }
+}
+
+/// Map an amplitude `v` to a brightness in `[0, 1]`, given a fixed `[vmin, vmax]`
+/// normalisation reference and a `log_amount ∈ [0, 1]` that blends smoothly
+/// between linear (0.0) and logarithmic (1.0) scaling.
+#[inline]
+fn brightness(v: f32, vmin: f32, vmax: f32, log_amount: f32) -> f32 {
+    let lin_range = (vmax - vmin).max(1e-30);
+    let t_lin = ((v - vmin) / lin_range).clamp(0.0, 1.0);
+
+    let lv    = log_compress(v);
+    let lvmin = log_compress(vmin);
+    let lvmax = log_compress(vmax);
+    let log_range = (lvmax - lvmin).max(1e-30);
+    let t_log = ((lv - lvmin) / log_range).clamp(0.0, 1.0);
+
+    t_lin + (t_log - t_lin) * log_amount.clamp(0.0, 1.0)
+}
+
 /// Convert a float scalogram to a raw RGBA image.
 /// `scalogram[s * width + col]` where s=0 is the lowest frequency.
 /// Image row 0 corresponds to the highest frequency (top of display).
+/// `vmin`/`vmax` are the fixed normalisation reference; `log_amount` blends
+/// between linear (0.0) and logarithmic (1.0) brightness scaling.
 pub fn scalogram_to_rgba(
     scalogram: &[f32],
     width: usize,
     num_scales: usize,
     colormap: ColorMap,
-    log_scale: bool,
+    vmin: f32,
+    vmax: f32,
+    log_amount: f32,
 ) -> Vec<u8> {
-    // Optionally take log
-    let values: Vec<f32> = if log_scale {
-        scalogram
-            .iter()
-            .map(|&v| if v > 0.0 { (v * 1e6 + 1.0).ln() } else { 0.0 })
-            .collect()
-    } else {
-        scalogram.to_vec()
-    };
-
-    let vmin = values.iter().cloned().fold(f32::INFINITY,     f32::min);
-    let vmax = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let range = (vmax - vmin).max(1e-30);
-
     let mut rgba = vec![0u8; num_scales * width * 4];
     for row in 0..num_scales {
         // Flip vertically: image row 0 = top = highest frequency
         let sc_row = num_scales - 1 - row;
         for col in 0..width {
-            let v = values[sc_row * width + col];
-            let t = (v - vmin) / range;
+            let v = scalogram[sc_row * width + col];
+            let t = brightness(v, vmin, vmax, log_amount);
             let [r, g, b] = colormap.apply(t);
             let idx = (row * width + col) * 4;
             rgba[idx]     = r;
             rgba[idx + 1] = g;
             rgba[idx + 2] = b;
+            rgba[idx + 3] = 255;
+        }
+    }
+    rgba
+}
+
+/// Convert HSV (all in 0..1, hue wraps) to an RGB triple in 0..1.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let h6 = (h - h.floor()) * 6.0;
+    let i  = h6.floor() as i32;
+    let f  = h6 - i as f32;
+    let p  = v * (1.0 - s);
+    let q  = v * (1.0 - s * f);
+    let t  = v * (1.0 - s * (1.0 - f));
+    match i {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
+}
+
+/// Render phase (radians, in (-π, π]) as a cyclic hue wheel.
+/// Layout matches `scalogram_to_rgba`: `phase[s*width+col]`, s=0 lowest freq,
+/// image row 0 = top = highest frequency.
+pub fn phase_to_rgba(phase: &[f32], width: usize, num_scales: usize) -> Vec<u8> {
+    use std::f32::consts::PI;
+    let mut rgba = vec![0u8; num_scales * width * 4];
+    for row in 0..num_scales {
+        let sc_row = num_scales - 1 - row;
+        for col in 0..width {
+            let ph  = phase[sc_row * width + col];
+            let hue = (ph + PI) / (2.0 * PI);   // map (-π, π] → [0, 1)
+            let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
+            let idx = (row * width + col) * 4;
+            rgba[idx]     = (r.clamp(0.0, 1.0) * 255.0) as u8;
+            rgba[idx + 1] = (g.clamp(0.0, 1.0) * 255.0) as u8;
+            rgba[idx + 2] = (b.clamp(0.0, 1.0) * 255.0) as u8;
+            rgba[idx + 3] = 255;
+        }
+    }
+    rgba
+}
+
+/// Render phase as hue and amplitude as brightness ("domain colouring").
+/// Amplitude is normalised the same way as `scalogram_to_rgba`.
+pub fn combined_to_rgba(
+    amplitude:  &[f32],
+    phase:      &[f32],
+    width:      usize,
+    num_scales: usize,
+    vmin:       f32,
+    vmax:       f32,
+    log_amount: f32,
+) -> Vec<u8> {
+    use std::f32::consts::PI;
+
+    let mut rgba = vec![0u8; num_scales * width * 4];
+    for row in 0..num_scales {
+        let sc_row = num_scales - 1 - row;
+        for col in 0..width {
+            let val = brightness(amplitude[sc_row * width + col], vmin, vmax, log_amount);
+            let ph  = phase[sc_row * width + col];
+            let hue = (ph + PI) / (2.0 * PI);
+            let (r, g, b) = hsv_to_rgb(hue, 1.0, val);
+            let idx = (row * width + col) * 4;
+            rgba[idx]     = (r.clamp(0.0, 1.0) * 255.0) as u8;
+            rgba[idx + 1] = (g.clamp(0.0, 1.0) * 255.0) as u8;
+            rgba[idx + 2] = (b.clamp(0.0, 1.0) * 255.0) as u8;
             rgba[idx + 3] = 255;
         }
     }

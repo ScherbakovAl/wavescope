@@ -19,16 +19,20 @@ extern "C" __global__ void real_to_complex_kernel(
 // omega_k = 2*pi*k/N  for k in [0, N/2]
 //          = 2*pi*(k-N)/N for k in (N/2, N)
 // Output: wavelet_freqs[scale_idx * N + k]
+// `omega0` is per-scale: omega0[s] is the central frequency for scale s,
+// kept consistent with scales[s] so the peak still lands at the target freq.
 extern "C" __global__ void morlet_freq_all_scales_kernel(
     cuFloatComplex* __restrict__ wavelet_freqs,
     const float* __restrict__   scales,
-    int N, int num_scales, float omega0)
+    int N, int num_scales,
+    const float* __restrict__   omega0)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     int s = blockIdx.y * blockDim.y + threadIdx.y;
     if (k >= N || s >= num_scales) return;
 
-    float scale = scales[s];
+    float scale  = scales[s];
+    float omega0s = omega0[s];
 
     float omega;
     if (k <= N / 2)
@@ -39,7 +43,7 @@ extern "C" __global__ void morlet_freq_all_scales_kernel(
     float s_omega = scale * omega;
     float val = 0.0f;
     if (s_omega > 0.0f) {
-        float diff = s_omega - omega0;
+        float diff = s_omega - omega0s;
         val = powf((float)M_PI, -0.25f)
             * sqrtf(2.0f * (float)M_PI)
             * sqrtf(scale)
@@ -73,6 +77,7 @@ extern "C" __global__ void multiply_signal_wavelets_kernel(
 extern "C" __global__ void extract_scalogram_kernel(
     const cuFloatComplex* __restrict__ cwt_rows,
     float* __restrict__                scalogram,
+    float* __restrict__                phase,
     int N, int num_scales,
     int valid_start, int valid_end,
     int width_pixels)
@@ -89,17 +94,26 @@ extern "C" __global__ void extract_scalogram_kernel(
     if (samp_end   > N)         samp_end   = N;
     if (samp_start >= N) {
         scalogram[s * width_pixels + col] = 0.0f;
+        phase[s * width_pixels + col]     = 0.0f;
         return;
     }
     if (samp_end <= samp_start) samp_end = samp_start + 1;
 
     float sum   = 0.0f;
+    float sum_re = 0.0f;
+    float sum_im = 0.0f;
     int   count = samp_end - samp_start;
     long long row_off = (long long)s * N;
     for (int t = samp_start; t < samp_end; t++) {
-        sum += cuCabsf(cwt_rows[row_off + t]);
+        cuFloatComplex c = cwt_rows[row_off + t];
+        sum    += cuCabsf(c);
+        sum_re += cuCrealf(c);
+        sum_im += cuCimagf(c);
     }
 
     // Divide by N for IFFT normalisation, then by count to average
     scalogram[s * width_pixels + col] = sum / ((float)N * (float)count);
+    // Phase of the (complex) mean. The N*count scaling is positive and does
+    // not affect atan2, so we take the phase of the raw complex sum.
+    phase[s * width_pixels + col] = atan2f(sum_im, sum_re);
 }

@@ -80,14 +80,15 @@ impl CwtEngine {
         width_pixels: usize,
         params:      &CwtParams,
         antialias:   bool,
-    ) -> anyhow::Result<Vec<f32>> {
+    ) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
         let total     = signal.len();
         let t_start   = t_start.min(total);
         let t_end     = t_end.min(total);
         let num_scales = params.num_scales;
 
         if t_start >= t_end || width_pixels == 0 || num_scales == 0 {
-            return Ok(vec![0.0f32; num_scales * width_pixels]);
+            return Ok((vec![0.0f32; num_scales * width_pixels],
+                       vec![0.0f32; num_scales * width_pixels]));
         }
 
         let visible_samples = t_end - t_start;
@@ -105,7 +106,8 @@ impl CwtEngine {
         // Scale for f_min in original samples: s_max = ω₀·fs / (2π·f_min)
         let f_min     = (params.f_min as f64).max(0.1);
         let f_max_eff = (params.f_max as f64).min(f_ds / 2.0 * 0.99).max(f_min * 1.01);
-        let s_max_orig = params.omega0 as f64 * sample_rate as f64
+        // Largest scale occurs at f_min, which uses ω₀ = omega0_low.
+        let s_max_orig = params.omega0_low as f64 * sample_rate as f64
             / (2.0 * PI * f_min);
         let padding = ((5.0 * s_max_orig) as usize).min(total / 2).max(16);
 
@@ -136,22 +138,29 @@ impl CwtEngine {
         let valid_end    = (valid_start + visible_samples / d + 1).min(seg_ds_len);
 
         if seg_ds_len < 4 || valid_start >= valid_end {
-            return Ok(vec![0.0f32; num_scales * width_pixels]);
+            return Ok((vec![0.0f32; num_scales * width_pixels],
+                       vec![0.0f32; num_scales * width_pixels]));
         }
 
         // Next power of two ≥ segment length, capped at 1 M to stay in VRAM
         let n_fft = seg_ds_len.next_power_of_two().min(1 << 20).max(64);
 
-        // ---- scales (log-spaced from f_min to f_max_eff) -----------------
-        // Scale in downsampled samples: s_i = ω₀ / (2π·f_i / f_ds)
-        let omega0 = params.omega0 as f64;
-        let scales: Vec<f32> = (0..num_scales)
-            .map(|i| {
-                let frac = i as f64 / (num_scales - 1).max(1) as f64;
-                let f_i  = f_min * (f_max_eff / f_min).powf(frac);
-                (omega0 * f_ds / (2.0 * PI * f_i)) as f32
-            })
-            .collect();
+        // ---- scales + per-scale ω₀ (log-spaced from f_min to f_max_eff) --
+        // ω₀ is log-interpolated in frequency between omega0_low (at f_min)
+        // and omega0_high (at f_max_eff). Scale is kept consistent with the
+        // row's ω₀ so the wavelet peak still lands exactly on f_i:
+        //   s_i = ω₀_i · f_ds / (2π·f_i)
+        let omega0_low  = params.omega0_low  as f64;
+        let omega0_high = params.omega0_high as f64;
+        let mut scales  = vec![0.0f32; num_scales];
+        let mut omega0s = vec![0.0f32; num_scales];
+        for i in 0..num_scales {
+            let frac    = i as f64 / (num_scales - 1).max(1) as f64;
+            let f_i     = f_min * (f_max_eff / f_min).powf(frac);
+            let omega0_i = omega0_low * (omega0_high / omega0_low).powf(frac);
+            scales[i]  = (omega0_i * f_ds / (2.0 * PI * f_i)) as f32;
+            omega0s[i] = omega0_i as f32;
+        }
 
         // ---- GPU memory --------------------------------------------------
         // cuFloatComplex = 2×f32 = 8 bytes
@@ -165,10 +174,12 @@ impl CwtEngine {
         let d_complex = CudaBuffer::alloc(bytes_c)?;
         let d_fft     = CudaBuffer::alloc(bytes_c)?;
         let d_scales  = CudaBuffer::alloc(bytes_sc)?;
+        let d_omega0  = CudaBuffer::alloc(bytes_sc)?;
         let d_wfreqs  = CudaBuffer::alloc(bytes_all)?;
         let d_prod    = CudaBuffer::alloc(bytes_all)?;
         let d_cwt     = CudaBuffer::alloc(bytes_all)?;
         let d_scalo   = CudaBuffer::alloc(bytes_out)?;
+        let d_phase   = CudaBuffer::alloc(bytes_out)?;
 
         // ---- upload -------------------------------------------------------
         let mut padded = vec![0.0f32; n_fft];
@@ -176,6 +187,7 @@ impl CwtEngine {
         padded[..copy_len].copy_from_slice(&segment_ds[..copy_len]);
         d_real.upload_f32(&padded)?;
         d_scales.upload_f32(&scales)?;
+        d_omega0.upload_f32(&omega0s)?;
 
         // ---- kernel helpers ----------------------------------------------
         let n32      = n_fft as i32;
@@ -215,7 +227,7 @@ impl CwtEngine {
             let mut a1 = d_scales.ptr();
             let mut a2 = n32;
             let mut a3 = ns32;
-            let mut a4 = params.omega0;
+            let mut a4 = d_omega0.ptr();
             let mut p: [*mut c_void; 5] = [
                 &mut a0 as *mut _ as *mut c_void,
                 &mut a1 as *mut _ as *mut c_void,
@@ -251,21 +263,23 @@ impl CwtEngine {
 
         // ---- 6. extract scalogram ----------------------------------------
         unsafe {
-            let mut a0 = d_cwt.ptr();
-            let mut a1 = d_scalo.ptr();
-            let mut a2 = n32;
-            let mut a3 = ns32;
-            let mut a4 = vs32;
-            let mut a5 = ve32;
-            let mut a6 = wp32;
-            let mut p: [*mut c_void; 7] = [
-                &mut a0 as *mut _ as *mut c_void,
-                &mut a1 as *mut _ as *mut c_void,
-                &mut a2 as *mut _ as *mut c_void,
-                &mut a3 as *mut _ as *mut c_void,
-                &mut a4 as *mut _ as *mut c_void,
-                &mut a5 as *mut _ as *mut c_void,
-                &mut a6 as *mut _ as *mut c_void,
+            let mut a0  = d_cwt.ptr();
+            let mut a1  = d_scalo.ptr();
+            let mut a1p = d_phase.ptr();
+            let mut a2  = n32;
+            let mut a3  = ns32;
+            let mut a4  = vs32;
+            let mut a5  = ve32;
+            let mut a6  = wp32;
+            let mut p: [*mut c_void; 8] = [
+                &mut a0  as *mut _ as *mut c_void,
+                &mut a1  as *mut _ as *mut c_void,
+                &mut a1p as *mut _ as *mut c_void,
+                &mut a2  as *mut _ as *mut c_void,
+                &mut a3  as *mut _ as *mut c_void,
+                &mut a4  as *mut _ as *mut c_void,
+                &mut a5  as *mut _ as *mut c_void,
+                &mut a6  as *mut _ as *mut c_void,
             ];
             self.fn_extract
                 .launch((gex, gky, 1), (bxy_x, bxy_y, 1), &mut p)?;
@@ -276,7 +290,9 @@ impl CwtEngine {
         // ---- download ----------------------------------------------------
         let mut scalogram = vec![0.0f32; num_scales * width_pixels];
         d_scalo.download_f32(&mut scalogram)?;
+        let mut phase = vec![0.0f32; num_scales * width_pixels];
+        d_phase.download_f32(&mut phase)?;
 
-        Ok(scalogram)
+        Ok((scalogram, phase))
     }
 }

@@ -4,7 +4,9 @@ use std::sync::{Arc, mpsc};
 use egui::TextureHandle;
 
 use crate::audio::AudioFile;
-use crate::colormap::{ColorMap, scalogram_to_rgba};
+use crate::colormap::{
+    combined_to_rgba, phase_to_rgba, scalogram_to_rgba, ColorMap, DisplayMode,
+};
 use crate::cuda::CudaContext;
 use crate::cwt::CwtEngine;
 use crate::wavelet::CwtParams;
@@ -30,7 +32,7 @@ pub struct ComputeRequest {
 
 pub enum WorkerResult {
     Loaded(AudioFile),
-    Computed(Vec<Vec<f32>>),   // one scalogram per channel
+    Computed(Vec<(Vec<f32>, Vec<f32>)>),   // (amplitude, phase) per channel
     Error(String),
 }
 
@@ -54,15 +56,22 @@ pub struct WaveletApp {
 
     // Scalogram data  [scale * width + col], one per channel
     scalograms:        Vec<Vec<f32>>,
+    phases:            Vec<Vec<f32>>,
     scalogram_width:   usize,
     textures:          Vec<Option<TextureHandle>>,
 
     // Viewport & parameters
-    viewport:   Viewport,
-    params:     CwtParams,
-    colormap:   ColorMap,
-    log_scale:  bool,
-    antialias:  bool,
+    viewport:     Viewport,
+    params:       CwtParams,
+    colormap:     ColorMap,
+    display_mode: DisplayMode,
+    log_amount:    f32,    // 0.0 = linear, 1.0 = logarithmic brightness
+    vmin:          f32,    // brightness window low end (raw amplitude)
+    vmax:          f32,    // brightness window high end (raw amplitude)
+    data_min:      f32,    // captured data extent → slider bounds
+    data_max:      f32,
+    norm_captured: bool,   // frozen after first compute; no auto-rescale
+    antialias:     bool,
 
     // Worker thread communication
     work_tx:    mpsc::SyncSender<WorkerMsg>,
@@ -87,12 +96,19 @@ impl WaveletApp {
         WaveletApp {
             audio:           None,
             scalograms:      Vec::new(),
+            phases:          Vec::new(),
             scalogram_width: 0,
             textures:        Vec::new(),
             viewport:        Viewport { t_start: 0.0, t_end: 1.0 },
             params:          CwtParams::default(),
             colormap:        ColorMap::Plasma,
-            log_scale:       true,
+            display_mode:    DisplayMode::Amplitude,
+            log_amount:      1.0,
+            vmin:            0.0,
+            vmax:            1.0,
+            data_min:        0.0,
+            data_max:        1.0,
+            norm_captured:   false,
             antialias:       true,
             work_tx,
             result_rx:       res_rx,
@@ -135,14 +151,50 @@ impl WaveletApp {
         let width = self.scalogram_width;
         self.textures.clear();
         if width == 0 { return; }
-        for sc in &self.scalograms {
+        let (vmin, vmax) = (self.vmin, self.vmax);
+        for (i, sc) in self.scalograms.iter().enumerate() {
             let num_scales = sc.len() / width;
             if num_scales == 0 { continue; }
-            let rgba = scalogram_to_rgba(sc, width, num_scales, self.colormap, self.log_scale);
+            let rgba = match (self.display_mode, self.phases.get(i)) {
+                (DisplayMode::Phase, Some(ph)) =>
+                    phase_to_rgba(ph, width, num_scales),
+                (DisplayMode::Combined, Some(ph)) =>
+                    combined_to_rgba(sc, ph, width, num_scales, vmin, vmax, self.log_amount),
+                _ =>
+                    scalogram_to_rgba(sc, width, num_scales, self.colormap, vmin, vmax, self.log_amount),
+            };
             let img  = egui::ColorImage::from_rgba_unmultiplied([width, num_scales], &rgba);
             let tex  = ctx.load_texture("scalogram", img, egui::TextureOptions::LINEAR);
             self.textures.push(Some(tex));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Global amplitude (vmin, vmax) over all current channels — used as the
+    // frozen normalisation reference so brightness does not auto-rescale.
+    // -----------------------------------------------------------------------
+    fn compute_norm(&self) -> (f32, f32) {
+        let mut vmin = f32::INFINITY;
+        let mut vmax = f32::NEG_INFINITY;
+        for sc in &self.scalograms {
+            for &v in sc {
+                if v < vmin { vmin = v; }
+                if v > vmax { vmax = v; }
+            }
+        }
+        if !vmin.is_finite() { vmin = 0.0; }
+        if !vmax.is_finite() { vmax = 1.0; }
+        (vmin, vmax)
+    }
+
+    /// Capture the data extent and reset the brightness window to span it.
+    /// Also positions the vmin/vmax sliders (their bounds and values).
+    fn capture_norm(&mut self) {
+        let (lo, hi) = self.compute_norm();
+        self.data_min = lo;
+        self.data_max = hi;
+        self.vmin     = lo;
+        self.vmax     = hi;
     }
 
     // -----------------------------------------------------------------------
@@ -185,9 +237,12 @@ impl WaveletApp {
 
         let mut changed = false;
 
-        ui.label("ω₀ (Morlet):");
+        ui.label("ω₀ (Morlet, low→high freq):");
         changed |= ui.add(
-            egui::Slider::new(&mut self.params.omega0, 4.0..=200.0).text("ω₀"),
+            egui::Slider::new(&mut self.params.omega0_low, 4.0..=200.0).text("ω₀ @f_min"),
+        ).changed();
+        changed |= ui.add(
+            egui::Slider::new(&mut self.params.omega0_high, 4.0..=200.0).text("ω₀ @f_max"),
         ).changed();
 
         ui.label("Scales:");
@@ -220,6 +275,21 @@ impl WaveletApp {
         ui.separator();
         ui.heading("Display");
 
+        egui::ComboBox::from_label("Mode")
+            .selected_text(self.display_mode.name())
+            .show_ui(ui, |ui| {
+                for dm in [
+                    DisplayMode::Amplitude,
+                    DisplayMode::Phase,
+                    DisplayMode::Combined,
+                ] {
+                    if ui.selectable_value(&mut self.display_mode, dm, dm.name()).changed() {
+                        let w = self.scalogram_width;
+                        if w > 0 { self.rebuild_textures(ctx); }
+                    }
+                }
+            });
+
         egui::ComboBox::from_label("Colormap")
             .selected_text(self.colormap.name())
             .show_ui(ui, |ui| {
@@ -234,9 +304,32 @@ impl WaveletApp {
                 }
             });
 
-        if ui.checkbox(&mut self.log_scale, "Log amplitude").changed() {
+        ui.label("Amplitude brightness (linear ↔ log):");
+        if ui.add(
+            egui::Slider::new(&mut self.log_amount, 0.0..=1.0).text("log amount"),
+        ).changed() {
             let w = self.scalogram_width;
             if w > 0 { self.rebuild_textures(ctx); }
+        }
+
+        ui.label("Brightness range:");
+        let lo = self.data_min;
+        let hi = self.data_max.max(self.data_min + 1e-12);
+        let mut range_changed = false;
+        range_changed |= ui.add(
+            egui::Slider::new(&mut self.vmin, lo..=hi).text("vmin"),
+        ).changed();
+        range_changed |= ui.add(
+            egui::Slider::new(&mut self.vmax, lo..=hi).text("vmax"),
+        ).changed();
+        if range_changed {
+            if self.vmin > self.vmax { self.vmin = self.vmax; }
+            if self.scalogram_width > 0 { self.rebuild_textures(ctx); }
+        }
+
+        if ui.button("Auto-normalize brightness").clicked() && self.scalogram_width > 0 {
+            self.capture_norm();
+            self.rebuild_textures(ctx);
         }
 
         if ui.checkbox(&mut self.antialias, "Anti-aliasing filter").changed()
@@ -530,15 +623,24 @@ impl eframe::App for WaveletApp {
                     self.params.f_max = (audio.sample_rate as f32 / 2.0).min(20_000.0);
                     self.textures = vec![None; audio.channels.len()];
                     self.scalograms.clear();
+                    self.norm_captured = false;   // recapture brightness reference for new file
                     self.audio = Some(audio);
                     // Trigger initial compute
                     self.computing = false;
                     self.trigger_compute(self.last_width_px);
                 }
-                WorkerResult::Computed(scals) => {
+                WorkerResult::Computed(results) => {
                     self.computing       = false;
+                    let (scals, phs): (Vec<_>, Vec<_>) = results.into_iter().unzip();
                     self.scalograms      = scals;
+                    self.phases          = phs;
                     self.scalogram_width = self.last_width_px;
+                    // Freeze the normalisation reference on the first compute
+                    // after load; keep it stable across zoom / freq changes.
+                    if !self.norm_captured {
+                        self.capture_norm();
+                        self.norm_captured = true;
+                    }
                     self.rebuild_textures(ctx);
                     self.status = "Ready.".into();
                     if self.pending_compute {

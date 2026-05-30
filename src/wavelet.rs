@@ -22,8 +22,13 @@ pub struct CwtParams {
     pub f_min: f32,
     /// Highest visible frequency in Hz.
     pub f_max: f32,
-    /// Morlet central frequency parameter ω₀ (typically 5–8).
-    pub omega0: f32,
+    /// Morlet central frequency ω₀ at `f_min` (low-frequency end).
+    pub omega0_low: f32,
+    /// Morlet central frequency ω₀ at `f_max` (high-frequency end).
+    /// Equal to `omega0_low` ⇒ classic constant-ω₀ (constant-Q) behaviour;
+    /// `omega0_high > omega0_low` ⇒ sharper frequency lines on the highs,
+    /// better time localisation on the lows. Log-interpolated in between.
+    pub omega0_high: f32,
 }
 
 impl Default for CwtParams {
@@ -32,7 +37,8 @@ impl Default for CwtParams {
             num_scales: 128,
             f_min: 20.0,
             f_max: 20_000.0,
-            omega0: 6.0,
+            omega0_low: 6.0,
+            omega0_high: 6.0,
         }
     }
 }
