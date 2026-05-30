@@ -78,11 +78,22 @@ extern "C" __global__ void multiply_signal_wavelets_kernel(
 // phase-locking value (vector strength). ≈1 when the phase is constant within
 // the pixel (resolvable), →0 when it rotates / averages out (aliased), so it
 // can drive saturation and suppress false phase colour where it is meaningless.
+//
+// `inst_dev[s*width+col]` = relative instantaneous-frequency deviation from the
+// row's nominal frequency, (f_inst − f_i)/f_i. The mean per-sample phase advance
+// is dφ = arg(Σ W[t+1]·conj(W[t])) (wrap-free, amplitude-weighted). Since the
+// scale satisfies s_i = ω₀_i·f_ds/(2π·f_i), we have 2π·f_i/f_ds = ω₀_i/s_i, so
+//   f_inst/f_i = dφ·s_i/ω₀_i  ⇒  inst_dev = dφ·scales[s]/omega0[s] − 1,
+// needing neither f_ds nor f_i. 0 ⇒ exactly on the row's centre frequency,
+// >0 above it, <0 below; its time-wobble exposes phase pulling / slips.
 extern "C" __global__ void extract_scalogram_kernel(
     const cuFloatComplex* __restrict__ cwt_rows,
     float* __restrict__                scalogram,
     float* __restrict__                phase,
     float* __restrict__                coherence,
+    float* __restrict__                inst_dev,
+    const float* __restrict__          scales,
+    const float* __restrict__          omega0,
     int N, int num_scales,
     int valid_start, int valid_end,
     int width_pixels)
@@ -101,6 +112,7 @@ extern "C" __global__ void extract_scalogram_kernel(
         scalogram[s * width_pixels + col] = 0.0f;
         phase[s * width_pixels + col]     = 0.0f;
         coherence[s * width_pixels + col] = 0.0f;
+        inst_dev[s * width_pixels + col]  = 0.0f;
         return;
     }
     if (samp_end <= samp_start) samp_end = samp_start + 1;
@@ -110,11 +122,17 @@ extern "C" __global__ void extract_scalogram_kernel(
     float sum_im = 0.0f;
     int   count = samp_end - samp_start;
     long long row_off = (long long)s * N;
+    // Lag-1 autocorrelation Σ W[t+1]·conj(W[t]) for the instantaneous frequency.
+    cuFloatComplex acc = make_cuFloatComplex(0.0f, 0.0f);
     for (int t = samp_start; t < samp_end; t++) {
         cuFloatComplex c = cwt_rows[row_off + t];
         sum    += cuCabsf(c);
         sum_re += cuCrealf(c);
         sum_im += cuCimagf(c);
+        if (t + 1 < N) {
+            cuFloatComplex cn = cwt_rows[row_off + t + 1];
+            acc = cuCaddf(acc, cuCmulf(cn, cuConjf(c)));
+        }
     }
 
     // Divide by N for IFFT normalisation, then by count to average
@@ -126,4 +144,9 @@ extern "C" __global__ void extract_scalogram_kernel(
     // 0 ⇒ rotating/averaged-out (aliased) ⇒ no meaningful phase to colour.
     float mag = sqrtf(sum_re * sum_re + sum_im * sum_im);
     coherence[s * width_pixels + col] = (sum > 0.0f) ? (mag / sum) : 0.0f;
+    // Relative instantaneous-frequency deviation (see header note).
+    float dphi  = atan2f(cuCimagf(acc), cuCrealf(acc));
+    float omega = omega0[s];
+    inst_dev[s * width_pixels + col] =
+        (omega > 0.0f) ? (dphi * scales[s] / omega - 1.0f) : 0.0f;
 }

@@ -17,6 +17,9 @@ pub enum DisplayMode {
     Phase,
     /// Phase as hue, amplitude as brightness (combined domain-colouring view).
     Combined,
+    /// Instantaneous-frequency deviation as a diverging blue↔red map, amplitude
+    /// as brightness — exposes phase "wobble" (pulling / slips) along a ridge.
+    InstFreq,
 }
 
 impl DisplayMode {
@@ -25,6 +28,28 @@ impl DisplayMode {
             DisplayMode::Amplitude => "Amplitude",
             DisplayMode::Phase     => "Phase",
             DisplayMode::Combined  => "Phase+Amplitude",
+            DisplayMode::InstFreq  => "Inst. frequency",
+        }
+    }
+}
+
+/// Reference baseline subtracted from the instantaneous frequency in the
+/// `InstFreq` view (see [`instfreq_to_rgba`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InstFreqBaseline {
+    /// `f_inst − f_i`: deviation from the row's nominal centre frequency. Clean
+    /// on the ridge; off-ridge rows carry a static (vertical) colour gradient.
+    Nominal,
+    /// `f_inst − ⟨f_inst⟩_local`: deviation from the row's local time-average.
+    /// Removes the off-ridge bias and slow drift, leaving only fast wobble.
+    Detrend,
+}
+
+impl InstFreqBaseline {
+    pub fn name(self) -> &'static str {
+        match self {
+            InstFreqBaseline::Nominal => "vs nominal",
+            InstFreqBaseline::Detrend => "detrend (time)",
         }
     }
 }
@@ -257,6 +282,77 @@ pub fn combined_to_rgba(
             rgba[idx]     = (r.clamp(0.0, 1.0) * 255.0) as u8;
             rgba[idx + 1] = (g.clamp(0.0, 1.0) * 255.0) as u8;
             rgba[idx + 2] = (b.clamp(0.0, 1.0) * 255.0) as u8;
+            rgba[idx + 3] = 255;
+        }
+    }
+    rgba
+}
+
+/// Diverging blue↔neutral↔red ("coolwarm") stops for the instantaneous-frequency
+/// view: blue below the baseline, light grey on it, red above.
+const COOLWARM: &[(f32, f32, f32, f32)] = &[
+    (0.00, 0.23, 0.45, 0.85),
+    (0.50, 0.86, 0.86, 0.86),
+    (1.00, 0.85, 0.28, 0.21),
+];
+
+/// Render the instantaneous-frequency deviation as a diverging blue↔red map with
+/// amplitude as brightness. `inst_dev[s*width+col]` is the relative deviation
+/// (f_inst − f_i)/f_i (0 = exactly on the row's centre frequency). `baseline`
+/// selects what is subtracted; `range` is the ± full-scale (relative) mapped to
+/// the colour ends; `detrend_win` is the moving-average window (pixels) used by
+/// `Detrend`. Amplitude is normalised exactly like `scalogram_to_rgba`, so silent
+/// regions fade to black and only energetic ridges reveal their phase wobble.
+#[allow(clippy::too_many_arguments)]
+pub fn instfreq_to_rgba(
+    inst_dev:    &[f32],
+    amplitude:   &[f32],
+    width:       usize,
+    num_scales:  usize,
+    baseline:    InstFreqBaseline,
+    range:       f32,
+    detrend_win: usize,
+    vmin:        f32,
+    vmax:        f32,
+    log_amount:  f32,
+) -> Vec<u8> {
+    let mut rgba = vec![0u8; num_scales * width * 4];
+    let full = range.max(1e-6);
+    let half = (detrend_win.max(1) / 2) as isize;
+    let mut psum = vec![0.0f32; width + 1];   // per-row prefix sum (reused)
+
+    for row in 0..num_scales {
+        let sc_row = num_scales - 1 - row;
+        let off = sc_row * width;
+
+        // Per-row prefix sum → moving-average baseline for the Detrend mode.
+        if baseline == InstFreqBaseline::Detrend {
+            for c in 0..width {
+                psum[c + 1] = psum[c] + inst_dev[off + c];
+            }
+        }
+
+        for col in 0..width {
+            let r = inst_dev[off + col];
+            let v = match baseline {
+                InstFreqBaseline::Nominal => r,
+                InstFreqBaseline::Detrend => {
+                    let lo = (col as isize - half).max(0) as usize;
+                    let hi = ((col as isize + half + 1).max(0) as usize).min(width);
+                    let mean = (psum[hi] - psum[lo]) / (hi - lo).max(1) as f32;
+                    r - mean
+                }
+            };
+            let t = (0.5 + v / (2.0 * full)).clamp(0.0, 1.0);
+            let (mut cr, mut cg, mut cb) = lerp_colormap(t, COOLWARM);
+            let gate = brightness(amplitude[off + col], vmin, vmax, log_amount);
+            cr *= gate;
+            cg *= gate;
+            cb *= gate;
+            let idx = (row * width + col) * 4;
+            rgba[idx]     = (cr.clamp(0.0, 1.0) * 255.0) as u8;
+            rgba[idx + 1] = (cg.clamp(0.0, 1.0) * 255.0) as u8;
+            rgba[idx + 2] = (cb.clamp(0.0, 1.0) * 255.0) as u8;
             rgba[idx + 3] = 255;
         }
     }

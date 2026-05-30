@@ -44,6 +44,10 @@ fn lowpass_zero_phase(signal: &[f32], cutoff_hz: f64, sample_rate: f64, order: u
 // CWT engine
 // ---------------------------------------------------------------------------
 
+/// CWT outputs for one channel, each laid out `[scale * width + col]`:
+/// (amplitude, phase, coherence, instantaneous-frequency deviation).
+pub type CwtOutput = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
 pub struct CwtEngine {
     context:              Arc<CudaContext>,
     fn_real_to_complex:   CudaFunction,
@@ -81,7 +85,7 @@ impl CwtEngine {
         width_pixels: usize,
         params:      &CwtParams,
         antialias:   bool,
-    ) -> anyhow::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    ) -> anyhow::Result<CwtOutput> {
         let total     = signal.len();
         let t_start   = t_start.min(total);
         let t_end     = t_end.min(total);
@@ -89,6 +93,7 @@ impl CwtEngine {
 
         if t_start >= t_end || width_pixels == 0 || num_scales == 0 {
             return Ok((vec![0.0f32; num_scales * width_pixels],
+                       vec![0.0f32; num_scales * width_pixels],
                        vec![0.0f32; num_scales * width_pixels],
                        vec![0.0f32; num_scales * width_pixels]));
         }
@@ -142,6 +147,7 @@ impl CwtEngine {
         if seg_ds_len < 4 || valid_start >= valid_end {
             return Ok((vec![0.0f32; num_scales * width_pixels],
                        vec![0.0f32; num_scales * width_pixels],
+                       vec![0.0f32; num_scales * width_pixels],
                        vec![0.0f32; num_scales * width_pixels]));
         }
 
@@ -184,6 +190,7 @@ impl CwtEngine {
         let d_scalo   = CudaBuffer::alloc(bytes_out)?;
         let d_phase   = CudaBuffer::alloc(bytes_out)?;
         let d_coher   = CudaBuffer::alloc(bytes_out)?;
+        let d_instdev = CudaBuffer::alloc(bytes_out)?;
 
         // ---- upload -------------------------------------------------------
         let mut padded = vec![0.0f32; n_fft];
@@ -271,16 +278,22 @@ impl CwtEngine {
             let mut a1  = d_scalo.ptr();
             let mut a1p = d_phase.ptr();
             let mut a1c = d_coher.ptr();
+            let mut a1d = d_instdev.ptr();
+            let mut a1s = d_scales.ptr();
+            let mut a1o = d_omega0.ptr();
             let mut a2  = n32;
             let mut a3  = ns32;
             let mut a4  = vs32;
             let mut a5  = ve32;
             let mut a6  = wp32;
-            let mut p: [*mut c_void; 9] = [
+            let mut p: [*mut c_void; 12] = [
                 &mut a0  as *mut _ as *mut c_void,
                 &mut a1  as *mut _ as *mut c_void,
                 &mut a1p as *mut _ as *mut c_void,
                 &mut a1c as *mut _ as *mut c_void,
+                &mut a1d as *mut _ as *mut c_void,
+                &mut a1s as *mut _ as *mut c_void,
+                &mut a1o as *mut _ as *mut c_void,
                 &mut a2  as *mut _ as *mut c_void,
                 &mut a3  as *mut _ as *mut c_void,
                 &mut a4  as *mut _ as *mut c_void,
@@ -300,7 +313,9 @@ impl CwtEngine {
         d_phase.download_f32(&mut phase)?;
         let mut coherence = vec![0.0f32; num_scales * width_pixels];
         d_coher.download_f32(&mut coherence)?;
+        let mut inst_dev = vec![0.0f32; num_scales * width_pixels];
+        d_instdev.download_f32(&mut inst_dev)?;
 
-        Ok((scalogram, phase, coherence))
+        Ok((scalogram, phase, coherence, inst_dev))
     }
 }

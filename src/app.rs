@@ -5,10 +5,11 @@ use egui::TextureHandle;
 
 use crate::audio::AudioFile;
 use crate::colormap::{
-    combined_to_rgba, phase_to_rgba, scalogram_to_rgba, ColorMap, DisplayMode,
+    combined_to_rgba, instfreq_to_rgba, phase_to_rgba, scalogram_to_rgba,
+    ColorMap, DisplayMode, InstFreqBaseline,
 };
 use crate::cuda::CudaContext;
-use crate::cwt::CwtEngine;
+use crate::cwt::{CwtEngine, CwtOutput};
 use crate::wavelet::CwtParams;
 
 // ---------------------------------------------------------------------------
@@ -32,7 +33,7 @@ pub struct ComputeRequest {
 
 pub enum WorkerResult {
     Loaded(AudioFile),
-    Computed(Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>),  // (amplitude, phase, coherence) per channel
+    Computed(Vec<CwtOutput>),  // (amplitude, phase, coherence, inst_dev) per channel
     Error(String),
 }
 
@@ -67,6 +68,7 @@ pub struct WaveletApp {
     scalograms:        Vec<Vec<f32>>,
     phases:            Vec<Vec<f32>>,
     coherences:        Vec<Vec<f32>>,
+    inst_devs:         Vec<Vec<f32>>,   // relative inst-freq deviation (f_inst−f_i)/f_i
     scalogram_width:   usize,
     textures:          Vec<Option<TextureHandle>>,
 
@@ -80,6 +82,9 @@ pub struct WaveletApp {
     colormap:     ColorMap,
     display_mode: DisplayMode,
     phase_gamma:   f32,    // coherence→saturation shaping for phase views
+    instfreq_baseline:    InstFreqBaseline, // what the inst-freq view subtracts
+    instfreq_range:       f32,    // ± full-scale (relative) of the diverging map
+    instfreq_detrend_win: usize,  // detrend moving-average window (pixels)
     log_amount:    f32,    // 0.0 = linear, 1.0 = logarithmic brightness
     vmin:          f32,    // brightness window low end (raw amplitude)
     vmax:          f32,    // brightness window high end (raw amplitude)
@@ -113,6 +118,7 @@ impl WaveletApp {
             scalograms:      Vec::new(),
             phases:          Vec::new(),
             coherences:      Vec::new(),
+            inst_devs:       Vec::new(),
             scalogram_width: 0,
             textures:        Vec::new(),
             viewport:        Viewport { t_start: 0.0, t_end: 1.0 },
@@ -124,6 +130,9 @@ impl WaveletApp {
             colormap:        ColorMap::Plasma,
             display_mode:    DisplayMode::Amplitude,
             phase_gamma:     2.0,
+            instfreq_baseline:    InstFreqBaseline::Nominal,
+            instfreq_range:       0.02,   // ±2 % relative deviation full-scale
+            instfreq_detrend_win: 32,
             log_amount:      1.0,
             vmin:            0.0,
             vmax:            1.0,
@@ -182,6 +191,12 @@ impl WaveletApp {
                     phase_to_rgba(ph, co, width, num_scales, self.phase_gamma),
                 (DisplayMode::Combined, Some(ph), Some(co)) =>
                     combined_to_rgba(sc, ph, co, width, num_scales, vmin, vmax, self.log_amount, self.phase_gamma),
+                (DisplayMode::InstFreq, _, _) if self.inst_devs.get(i).is_some() =>
+                    instfreq_to_rgba(
+                        &self.inst_devs[i], sc, width, num_scales,
+                        self.instfreq_baseline, self.instfreq_range,
+                        self.instfreq_detrend_win, vmin, vmax, self.log_amount,
+                    ),
                 _ =>
                     scalogram_to_rgba(sc, width, num_scales, self.colormap, vmin, vmax, self.log_amount),
             };
@@ -189,8 +204,8 @@ impl WaveletApp {
             // Phase hue must not be bilinearly blended (wraps +π/−π through the
             // whole wheel ⇒ false bands), so use NEAREST for phase-based views.
             let opts = match self.display_mode {
-                DisplayMode::Amplitude => egui::TextureOptions::LINEAR,
-                _                      => egui::TextureOptions::NEAREST,
+                DisplayMode::Amplitude | DisplayMode::InstFreq => egui::TextureOptions::LINEAR,
+                _                                              => egui::TextureOptions::NEAREST,
             };
             let tex  = ctx.load_texture("scalogram", img, opts);
             self.textures.push(Some(tex));
@@ -310,6 +325,7 @@ impl WaveletApp {
                     DisplayMode::Amplitude,
                     DisplayMode::Phase,
                     DisplayMode::Combined,
+                    DisplayMode::InstFreq,
                 ] {
                     if ui.selectable_value(&mut self.display_mode, dm, dm.name()).changed() {
                         let w = self.scalogram_width;
@@ -339,6 +355,41 @@ impl WaveletApp {
             ).changed() {
                 let w = self.scalogram_width;
                 if w > 0 { self.rebuild_textures(ctx); }
+            }
+        }
+
+        if self.display_mode == DisplayMode::InstFreq {
+            egui::ComboBox::from_label("Baseline")
+                .selected_text(self.instfreq_baseline.name())
+                .show_ui(ui, |ui| {
+                    for b in [InstFreqBaseline::Nominal, InstFreqBaseline::Detrend] {
+                        if ui.selectable_value(&mut self.instfreq_baseline, b, b.name()).changed() {
+                            let w = self.scalogram_width;
+                            if w > 0 { self.rebuild_textures(ctx); }
+                        }
+                    }
+                });
+
+            ui.label("Deviation full-scale (±, relative):");
+            if ui.add(
+                egui::Slider::new(&mut self.instfreq_range, 0.002..=0.5)
+                    .logarithmic(true)
+                    .text("±rel"),
+            ).changed() {
+                let w = self.scalogram_width;
+                if w > 0 { self.rebuild_textures(ctx); }
+            }
+
+            if self.instfreq_baseline == InstFreqBaseline::Detrend {
+                ui.label("Detrend window (px):");
+                let mut win = self.instfreq_detrend_win as u32;
+                if ui.add(
+                    egui::Slider::new(&mut win, 3..=256).logarithmic(true).text("px"),
+                ).changed() {
+                    self.instfreq_detrend_win = win as usize;
+                    let w = self.scalogram_width;
+                    if w > 0 { self.rebuild_textures(ctx); }
+                }
             }
         }
 
@@ -836,14 +887,17 @@ impl eframe::App for WaveletApp {
                     let mut scals = Vec::with_capacity(results.len());
                     let mut phs   = Vec::with_capacity(results.len());
                     let mut cohs  = Vec::with_capacity(results.len());
-                    for (a, p, c) in results {
+                    let mut idevs = Vec::with_capacity(results.len());
+                    for (a, p, c, d) in results {
                         scals.push(a);
                         phs.push(p);
                         cohs.push(c);
+                        idevs.push(d);
                     }
                     self.scalograms      = scals;
                     self.phases          = phs;
                     self.coherences      = cohs;
+                    self.inst_devs       = idevs;
                     self.scalogram_width = self.last_width_px;
                     // Freeze the normalisation reference on the first compute
                     // after load; keep it stable across zoom / freq changes.
