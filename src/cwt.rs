@@ -49,11 +49,11 @@ fn lowpass_zero_phase(signal: &[f32], cutoff_hz: f64, sample_rate: f64, order: u
 pub type CwtOutput = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
 pub struct CwtEngine {
-    context:              Arc<CudaContext>,
-    fn_real_to_complex:   CudaFunction,
-    fn_morlet_all_scales: CudaFunction,
-    fn_multiply:          CudaFunction,
-    fn_extract:           CudaFunction,
+    context:               Arc<CudaContext>,
+    fn_real_to_complex:    CudaFunction,
+    fn_wavelet_all_scales: CudaFunction,
+    fn_multiply:           CudaFunction,
+    fn_extract:            CudaFunction,
 }
 
 impl CwtEngine {
@@ -63,10 +63,10 @@ impl CwtEngine {
     ) -> anyhow::Result<Self> {
         Ok(CwtEngine {
             context,
-            fn_real_to_complex:   module.get_function("real_to_complex_kernel")?,
-            fn_morlet_all_scales: module.get_function("morlet_freq_all_scales_kernel")?,
-            fn_multiply:          module.get_function("multiply_signal_wavelets_kernel")?,
-            fn_extract:           module.get_function("extract_scalogram_kernel")?,
+            fn_real_to_complex:    module.get_function("real_to_complex_kernel")?,
+            fn_wavelet_all_scales: module.get_function("wavelet_freq_all_scales_kernel")?,
+            fn_multiply:           module.get_function("multiply_signal_wavelets_kernel")?,
+            fn_extract:            module.get_function("extract_scalogram_kernel")?,
         })
     }
 
@@ -109,14 +109,19 @@ impl CwtEngine {
         let d = (visible_samples / width_pixels).max(1).min(max_d_for_fmax);
         let f_ds = sample_rate as f64 / d as f64;   // effective sample rate
 
-        // ---- padding (half wavelet support at the lowest frequency) -------
-        // Scale for f_min in original samples: s_max = ω₀·fs / (2π·f_min)
+        // ---- padding (wavelet support at the lowest frequency) ------------
+        // Largest scale occurs at f_min, using the wavelet's peak η there:
+        //   s_max = η·fs / (2π·f_min).
         let f_min     = (params.f_min as f64).max(0.1);
         let f_max_eff = (params.f_max as f64).min(f_ds / 2.0 * 0.99).max(f_min * 1.01);
-        // Largest scale occurs at f_min, which uses ω₀ = omega0_low.
-        let s_max_orig = params.omega0_low as f64 * sample_rate as f64
-            / (2.0 * PI * f_min);
-        let padding = ((5.0 * s_max_orig) as usize).min(total / 2).max(16);
+        let eta_low    = params.peak_eta(0.0);
+        let s_max_orig = eta_low * sample_rate as f64 / (2.0 * PI * f_min);
+        // Broad families (Morse/Paul/Bump) ring longer in time than the Morlet
+        // baseline; cover their support expressed as cycles at f_min as well.
+        let pad_cycles = params.support_cycles() * sample_rate as f64 / f_min;
+        let padding = ((5.0 * s_max_orig).max(pad_cycles) as usize)
+            .min(total / 2)
+            .max(16);
 
         // ---- extract + downsample segment ---------------------------------
         let seg_start = t_start.saturating_sub(padding);
@@ -154,21 +159,19 @@ impl CwtEngine {
         // Next power of two ≥ segment length, capped at 1 M to stay in VRAM
         let n_fft = seg_ds_len.next_power_of_two().clamp(64, 1 << 20);
 
-        // ---- scales + per-scale ω₀ (log-spaced from f_min to f_max_eff) --
-        // ω₀ is log-interpolated in frequency between omega0_low (at f_min)
-        // and omega0_high (at f_max_eff). Scale is kept consistent with the
-        // row's ω₀ so the wavelet peak still lands exactly on f_i:
-        //   s_i = ω₀_i · f_ds / (2π·f_i)
-        let omega0_low  = params.omega0_low  as f64;
-        let omega0_high = params.omega0_high as f64;
-        let mut scales  = vec![0.0f32; num_scales];
-        let mut omega0s = vec![0.0f32; num_scales];
+        // ---- scales + per-scale η (log-spaced from f_min to f_max_eff) ---
+        // η is the wavelet's dimensionless peak frequency (= ω₀ for Morlet,
+        // possibly log-interpolated low→high; constant for the other families).
+        // Scale is kept consistent with η so the peak lands exactly on f_i:
+        //   s_i = η_i · f_ds / (2π·f_i)
+        let mut scales = vec![0.0f32; num_scales];
+        let mut etas   = vec![0.0f32; num_scales];
         for i in 0..num_scales {
-            let frac    = i as f64 / (num_scales - 1).max(1) as f64;
-            let f_i     = f_min * (f_max_eff / f_min).powf(frac);
-            let omega0_i = omega0_low * (omega0_high / omega0_low).powf(frac);
-            scales[i]  = (omega0_i * f_ds / (2.0 * PI * f_i)) as f32;
-            omega0s[i] = omega0_i as f32;
+            let frac  = i as f64 / (num_scales - 1).max(1) as f64;
+            let f_i   = f_min * (f_max_eff / f_min).powf(frac);
+            let eta_i = params.peak_eta(frac);
+            scales[i] = (eta_i * f_ds / (2.0 * PI * f_i)) as f32;
+            etas[i]   = eta_i as f32;
         }
 
         // ---- GPU memory --------------------------------------------------
@@ -183,7 +186,7 @@ impl CwtEngine {
         let d_complex = CudaBuffer::alloc(bytes_c)?;
         let d_fft     = CudaBuffer::alloc(bytes_c)?;
         let d_scales  = CudaBuffer::alloc(bytes_sc)?;
-        let d_omega0  = CudaBuffer::alloc(bytes_sc)?;
+        let d_eta     = CudaBuffer::alloc(bytes_sc)?;
         let d_wfreqs  = CudaBuffer::alloc(bytes_all)?;
         let d_prod    = CudaBuffer::alloc(bytes_all)?;
         let d_cwt     = CudaBuffer::alloc(bytes_all)?;
@@ -198,7 +201,7 @@ impl CwtEngine {
         padded[..copy_len].copy_from_slice(&segment_ds[..copy_len]);
         d_real.upload_f32(&padded)?;
         d_scales.upload_f32(&scales)?;
-        d_omega0.upload_f32(&omega0s)?;
+        d_eta.upload_f32(&etas)?;
 
         // ---- kernel helpers ----------------------------------------------
         let n32      = n_fft as i32;
@@ -206,6 +209,8 @@ impl CwtEngine {
         let wp32     = width_pixels as i32;
         let vs32     = valid_start as i32;
         let ve32     = valid_end   as i32;
+        let kind32   = params.kind.code();
+        let (p1, p2) = params.kernel_params();
 
         let bx: u32 = 256;
         let bxy_x: u32 = 32;
@@ -232,21 +237,27 @@ impl CwtEngine {
         let plan_fwd = CufftPlan::plan_single_c2c(n_fft)?;
         plan_fwd.exec_c2c(d_complex.ptr(), d_fft.ptr(), CUFFT_FORWARD)?;
 
-        // ---- 3. Morlet in frequency domain for all scales ----------------
+        // ---- 3. wavelet in frequency domain for all scales ---------------
         unsafe {
             let mut a0 = d_wfreqs.ptr();
             let mut a1 = d_scales.ptr();
             let mut a2 = n32;
             let mut a3 = ns32;
-            let mut a4 = d_omega0.ptr();
-            let mut p: [*mut c_void; 5] = [
+            let mut a4 = d_eta.ptr();
+            let mut a5 = kind32;
+            let mut a6 = p1;
+            let mut a7 = p2;
+            let mut p: [*mut c_void; 8] = [
                 &mut a0 as *mut _ as *mut c_void,
                 &mut a1 as *mut _ as *mut c_void,
                 &mut a2 as *mut _ as *mut c_void,
                 &mut a3 as *mut _ as *mut c_void,
                 &mut a4 as *mut _ as *mut c_void,
+                &mut a5 as *mut _ as *mut c_void,
+                &mut a6 as *mut _ as *mut c_void,
+                &mut a7 as *mut _ as *mut c_void,
             ];
-            self.fn_morlet_all_scales
+            self.fn_wavelet_all_scales
                 .launch((gkx, gky, 1), (bxy_x, bxy_y, 1), &mut p)?;
         }
 
@@ -280,7 +291,7 @@ impl CwtEngine {
             let mut a1c = d_coher.ptr();
             let mut a1d = d_instdev.ptr();
             let mut a1s = d_scales.ptr();
-            let mut a1o = d_omega0.ptr();
+            let mut a1o = d_eta.ptr();
             let mut a2  = n32;
             let mut a3  = ns32;
             let mut a4  = vs32;

@@ -12,27 +12,31 @@ extern "C" __global__ void real_to_complex_kernel(
     out[i] = make_cuFloatComplex(in[i], 0.0f);
 }
 
-// Compute Morlet wavelet in frequency domain for all scales simultaneously.
-// For scale s, the Morlet in freq domain (normalized angular freq omega_k):
-//   psi_hat_s(k) = pi^(-1/4) * sqrt(2*pi) * sqrt(s) * exp(-0.5*(s*omega_k - omega0)^2)
-//                  for s*omega_k > 0, else 0
-// omega_k = 2*pi*k/N  for k in [0, N/2]
-//          = 2*pi*(k-N)/N for k in (N/2, N)
+// Compute the analysing wavelet in the frequency domain for all scales at once.
+// Evaluated at the dimensionless frequency w = s*omega_k, where
+//   omega_k = 2*pi*k/N      for k in [0, N/2]
+//           = 2*pi*(k-N)/N  for k in (N/2, N)
+// so w<0 on the negative-frequency half ⇒ all families return 0 there (analytic).
+// `eta[s]` is the per-scale dimensionless peak (= centre for Morlet/Bump), kept
+// consistent with scales[s] so the peak lands on the row's target frequency.
+// `kind`: 0 Morlet, 1 Generalized Morse, 2 Bump, 3 Paul.
+// `p1`,`p2`: shape parameters — Morse: (beta, gamma); Bump: (sigma, _);
+//            Paul: (order m, _); Morlet: unused.
+// The non-Morlet families are peak-normalised to ~1 (× sqrt(s) for cross-scale
+// energy), so β/γ/m/σ can be large without over/underflow.
 // Output: wavelet_freqs[scale_idx * N + k]
-// `omega0` is per-scale: omega0[s] is the central frequency for scale s,
-// kept consistent with scales[s] so the peak still lands at the target freq.
-extern "C" __global__ void morlet_freq_all_scales_kernel(
+extern "C" __global__ void wavelet_freq_all_scales_kernel(
     cuFloatComplex* __restrict__ wavelet_freqs,
     const float* __restrict__   scales,
     int N, int num_scales,
-    const float* __restrict__   omega0)
+    const float* __restrict__   eta,
+    int kind, float p1, float p2)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     int s = blockIdx.y * blockDim.y + threadIdx.y;
     if (k >= N || s >= num_scales) return;
 
-    float scale  = scales[s];
-    float omega0s = omega0[s];
+    float scale = scales[s];
 
     float omega;
     if (k <= N / 2)
@@ -40,14 +44,39 @@ extern "C" __global__ void morlet_freq_all_scales_kernel(
     else
         omega = 2.0f * (float)M_PI * (float)(k - N) / (float)N;
 
-    float s_omega = scale * omega;
+    float w  = scale * omega;          // dimensionless frequency s·ω
+    float sq = sqrtf(scale);
     float val = 0.0f;
-    if (s_omega > 0.0f) {
-        float diff = s_omega - omega0s;
-        val = powf((float)M_PI, -0.25f)
-            * sqrtf(2.0f * (float)M_PI)
-            * sqrtf(scale)
-            * expf(-0.5f * diff * diff);
+
+    if (w > 0.0f) {
+        switch (kind) {
+        case 0: {   // Morlet: Gaussian in frequency centred at eta[s]=ω₀
+            float diff = w - eta[s];
+            val = powf((float)M_PI, -0.25f)
+                * sqrtf(2.0f * (float)M_PI)
+                * sq
+                * expf(-0.5f * diff * diff);
+        } break;
+        case 1: {   // Generalized Morse: w^beta * exp(-w^gamma), peak-normalised
+            float beta  = p1;
+            float gamma = p2;
+            float wpeak = powf(beta / gamma, 1.0f / gamma);
+            float lg = beta * logf(w / wpeak) - powf(w, gamma) + beta / gamma;
+            val = sq * expf(lg);
+        } break;
+        case 2: {   // Bump: compact on (mu-sigma, mu+sigma), peak 1 at mu
+            float mu    = eta[s];
+            float sigma = p1;
+            float x = (w - mu) / sigma;
+            if (x > -1.0f && x < 1.0f)
+                val = sq * expf(1.0f - 1.0f / (1.0f - x * x));
+        } break;
+        case 3: {   // Paul: w^m * exp(-w), peak-normalised
+            float m = p1;
+            float lg = m * logf(w / m) - w + m;
+            val = sq * expf(lg);
+        } break;
+        }
     }
 
     wavelet_freqs[(long long)s * N + k] = make_cuFloatComplex(val, 0.0f);
@@ -82,8 +111,9 @@ extern "C" __global__ void multiply_signal_wavelets_kernel(
 // `inst_dev[s*width+col]` = relative instantaneous-frequency deviation from the
 // row's nominal frequency, (f_inst − f_i)/f_i. The mean per-sample phase advance
 // is dφ = arg(Σ W[t+1]·conj(W[t])) (wrap-free, amplitude-weighted). Since the
-// scale satisfies s_i = ω₀_i·f_ds/(2π·f_i), we have 2π·f_i/f_ds = ω₀_i/s_i, so
-//   f_inst/f_i = dφ·s_i/ω₀_i  ⇒  inst_dev = dφ·scales[s]/omega0[s] − 1,
+// scale satisfies s_i = η_i·f_ds/(2π·f_i) (η = wavelet peak), we have
+// 2π·f_i/f_ds = η_i/s_i, so
+//   f_inst/f_i = dφ·s_i/η_i  ⇒  inst_dev = dφ·scales[s]/eta[s] − 1,
 // needing neither f_ds nor f_i. 0 ⇒ exactly on the row's centre frequency,
 // >0 above it, <0 below; its time-wobble exposes phase pulling / slips.
 extern "C" __global__ void extract_scalogram_kernel(
@@ -93,7 +123,7 @@ extern "C" __global__ void extract_scalogram_kernel(
     float* __restrict__                coherence,
     float* __restrict__                inst_dev,
     const float* __restrict__          scales,
-    const float* __restrict__          omega0,
+    const float* __restrict__          eta,
     int N, int num_scales,
     int valid_start, int valid_end,
     int width_pixels)
@@ -145,8 +175,8 @@ extern "C" __global__ void extract_scalogram_kernel(
     float mag = sqrtf(sum_re * sum_re + sum_im * sum_im);
     coherence[s * width_pixels + col] = (sum > 0.0f) ? (mag / sum) : 0.0f;
     // Relative instantaneous-frequency deviation (see header note).
-    float dphi  = atan2f(cuCimagf(acc), cuCrealf(acc));
-    float omega = omega0[s];
+    float dphi   = atan2f(cuCimagf(acc), cuCrealf(acc));
+    float eta_s  = eta[s];
     inst_dev[s * width_pixels + col] =
-        (omega > 0.0f) ? (dphi * scales[s] / omega - 1.0f) : 0.0f;
+        (eta_s > 0.0f) ? (dphi * scales[s] / eta_s - 1.0f) : 0.0f;
 }

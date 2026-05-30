@@ -10,7 +10,7 @@ use crate::colormap::{
 };
 use crate::cuda::CudaContext;
 use crate::cwt::{CwtEngine, CwtOutput};
-use crate::wavelet::CwtParams;
+use crate::wavelet::{CwtParams, WaveletKind};
 
 // ---------------------------------------------------------------------------
 // Worker thread messages
@@ -280,13 +280,57 @@ impl WaveletApp {
 
         let mut changed = false;
 
-        ui.label("ω₀ (Morlet, low→high freq):");
-        changed |= ui.add(
-            egui::Slider::new(&mut self.params.omega0_low, 4.0..=200.0).text("ω₀ @f_min"),
-        ).changed();
-        changed |= ui.add(
-            egui::Slider::new(&mut self.params.omega0_high, 4.0..=200.0).text("ω₀ @f_max"),
-        ).changed();
+        // Wavelet family selector.
+        egui::ComboBox::from_label("Wavelet")
+            .selected_text(self.params.kind.name())
+            .show_ui(ui, |ui| {
+                for k in [
+                    WaveletKind::Morlet,
+                    WaveletKind::Morse,
+                    WaveletKind::Bump,
+                    WaveletKind::Paul,
+                ] {
+                    changed |= ui
+                        .selectable_value(&mut self.params.kind, k, k.name())
+                        .changed();
+                }
+            });
+
+        // Per-family shape controls.
+        match self.params.kind {
+            WaveletKind::Morlet => {
+                ui.label("ω₀ (low→high freq):");
+                changed |= ui.add(
+                    egui::Slider::new(&mut self.params.omega0_low, 4.0..=200.0).text("ω₀ @f_min"),
+                ).changed();
+                changed |= ui.add(
+                    egui::Slider::new(&mut self.params.omega0_high, 4.0..=200.0).text("ω₀ @f_max"),
+                ).changed();
+            }
+            WaveletKind::Morse => {
+                ui.label("Generalized Morse (β sharpness, γ symmetry):");
+                changed |= ui.add(
+                    egui::Slider::new(&mut self.params.morse_beta, 1.0..=60.0).text("β"),
+                ).changed();
+                changed |= ui.add(
+                    egui::Slider::new(&mut self.params.morse_gamma, 1.0..=8.0).text("γ"),
+                ).changed();
+            }
+            WaveletKind::Bump => {
+                ui.label("Bump (σ = bandwidth; smaller ⇒ sharper freq):");
+                changed |= ui.add(
+                    egui::Slider::new(&mut self.params.bump_sigma, 0.1..=2.0).text("σ"),
+                ).changed();
+            }
+            WaveletKind::Paul => {
+                ui.label("Paul (order m; larger ⇒ sharper freq):");
+                let mut m = self.params.paul_order.round() as u32;
+                if ui.add(egui::Slider::new(&mut m, 1..=40).text("m")).changed() {
+                    self.params.paul_order = m as f32;
+                    changed = true;
+                }
+            }
+        }
 
         ui.label("Scales:");
         let mut ns = self.params.num_scales as u32;
