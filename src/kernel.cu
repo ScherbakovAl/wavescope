@@ -74,10 +74,15 @@ extern "C" __global__ void multiply_signal_wavelets_kernel(
 // Row 0 in scalogram = scale 0 (lowest freq), row num_scales-1 = highest freq.
 // scalogram[s * width_pixels + col] = mean |cwt_rows[s*N + t]| / N
 //   for t in [samp_start, samp_end) within [valid_start, valid_end)
+// `coherence[s*width+col]` = |Σz| / Σ|z| ∈ [0,1] over the same samples: the
+// phase-locking value (vector strength). ≈1 when the phase is constant within
+// the pixel (resolvable), →0 when it rotates / averages out (aliased), so it
+// can drive saturation and suppress false phase colour where it is meaningless.
 extern "C" __global__ void extract_scalogram_kernel(
     const cuFloatComplex* __restrict__ cwt_rows,
     float* __restrict__                scalogram,
     float* __restrict__                phase,
+    float* __restrict__                coherence,
     int N, int num_scales,
     int valid_start, int valid_end,
     int width_pixels)
@@ -95,6 +100,7 @@ extern "C" __global__ void extract_scalogram_kernel(
     if (samp_start >= N) {
         scalogram[s * width_pixels + col] = 0.0f;
         phase[s * width_pixels + col]     = 0.0f;
+        coherence[s * width_pixels + col] = 0.0f;
         return;
     }
     if (samp_end <= samp_start) samp_end = samp_start + 1;
@@ -116,4 +122,8 @@ extern "C" __global__ void extract_scalogram_kernel(
     // Phase of the (complex) mean. The N*count scaling is positive and does
     // not affect atan2, so we take the phase of the raw complex sum.
     phase[s * width_pixels + col] = atan2f(sum_im, sum_re);
+    // Phase-locking value: |Σz| / Σ|z|. 1 ⇒ phase constant within the pixel,
+    // 0 ⇒ rotating/averaged-out (aliased) ⇒ no meaningful phase to colour.
+    float mag = sqrtf(sum_re * sum_re + sum_im * sum_im);
+    coherence[s * width_pixels + col] = (sum > 0.0f) ? (mag / sum) : 0.0f;
 }

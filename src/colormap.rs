@@ -199,15 +199,25 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
 /// Render phase (radians, in (-π, π]) as a cyclic hue wheel.
 /// Layout matches `scalogram_to_rgba`: `phase[s*width+col]`, s=0 lowest freq,
 /// image row 0 = top = highest frequency.
-pub fn phase_to_rgba(phase: &[f32], width: usize, num_scales: usize) -> Vec<u8> {
+/// `coherence ∈ [0,1]` (phase-locking value) drives saturation: where the phase
+/// is unresolvable within the pixel (rotating/aliased) it fades to white, so no
+/// false rainbow colour appears. `gamma` shapes that fade (higher ⇒ stricter).
+pub fn phase_to_rgba(
+    phase: &[f32],
+    coherence: &[f32],
+    width: usize,
+    num_scales: usize,
+    gamma: f32,
+) -> Vec<u8> {
     use std::f32::consts::PI;
     let mut rgba = vec![0u8; num_scales * width * 4];
     for row in 0..num_scales {
         let sc_row = num_scales - 1 - row;
         for col in 0..width {
             let ph  = phase[sc_row * width + col];
+            let sat = coherence[sc_row * width + col].clamp(0.0, 1.0).powf(gamma);
             let hue = (ph + PI) / (2.0 * PI);   // map (-π, π] → [0, 1)
-            let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
+            let (r, g, b) = hsv_to_rgb(hue, sat, 1.0);
             let idx = (row * width + col) * 4;
             rgba[idx]     = (r.clamp(0.0, 1.0) * 255.0) as u8;
             rgba[idx + 1] = (g.clamp(0.0, 1.0) * 255.0) as u8;
@@ -223,11 +233,13 @@ pub fn phase_to_rgba(phase: &[f32], width: usize, num_scales: usize) -> Vec<u8> 
 pub fn combined_to_rgba(
     amplitude:  &[f32],
     phase:      &[f32],
+    coherence:  &[f32],
     width:      usize,
     num_scales: usize,
     vmin:       f32,
     vmax:       f32,
     log_amount: f32,
+    gamma:      f32,
 ) -> Vec<u8> {
     use std::f32::consts::PI;
 
@@ -237,8 +249,9 @@ pub fn combined_to_rgba(
         for col in 0..width {
             let val = brightness(amplitude[sc_row * width + col], vmin, vmax, log_amount);
             let ph  = phase[sc_row * width + col];
+            let sat = coherence[sc_row * width + col].clamp(0.0, 1.0).powf(gamma);
             let hue = (ph + PI) / (2.0 * PI);
-            let (r, g, b) = hsv_to_rgb(hue, 1.0, val);
+            let (r, g, b) = hsv_to_rgb(hue, sat, val);
             let idx = (row * width + col) * 4;
             rgba[idx]     = (r.clamp(0.0, 1.0) * 255.0) as u8;
             rgba[idx + 1] = (g.clamp(0.0, 1.0) * 255.0) as u8;

@@ -80,7 +80,7 @@ impl CwtEngine {
         width_pixels: usize,
         params:      &CwtParams,
         antialias:   bool,
-    ) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+    ) -> anyhow::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let total     = signal.len();
         let t_start   = t_start.min(total);
         let t_end     = t_end.min(total);
@@ -88,6 +88,7 @@ impl CwtEngine {
 
         if t_start >= t_end || width_pixels == 0 || num_scales == 0 {
             return Ok((vec![0.0f32; num_scales * width_pixels],
+                       vec![0.0f32; num_scales * width_pixels],
                        vec![0.0f32; num_scales * width_pixels]));
         }
 
@@ -139,6 +140,7 @@ impl CwtEngine {
 
         if seg_ds_len < 4 || valid_start >= valid_end {
             return Ok((vec![0.0f32; num_scales * width_pixels],
+                       vec![0.0f32; num_scales * width_pixels],
                        vec![0.0f32; num_scales * width_pixels]));
         }
 
@@ -180,6 +182,7 @@ impl CwtEngine {
         let d_cwt     = CudaBuffer::alloc(bytes_all)?;
         let d_scalo   = CudaBuffer::alloc(bytes_out)?;
         let d_phase   = CudaBuffer::alloc(bytes_out)?;
+        let d_coher   = CudaBuffer::alloc(bytes_out)?;
 
         // ---- upload -------------------------------------------------------
         let mut padded = vec![0.0f32; n_fft];
@@ -266,15 +269,17 @@ impl CwtEngine {
             let mut a0  = d_cwt.ptr();
             let mut a1  = d_scalo.ptr();
             let mut a1p = d_phase.ptr();
+            let mut a1c = d_coher.ptr();
             let mut a2  = n32;
             let mut a3  = ns32;
             let mut a4  = vs32;
             let mut a5  = ve32;
             let mut a6  = wp32;
-            let mut p: [*mut c_void; 8] = [
+            let mut p: [*mut c_void; 9] = [
                 &mut a0  as *mut _ as *mut c_void,
                 &mut a1  as *mut _ as *mut c_void,
                 &mut a1p as *mut _ as *mut c_void,
+                &mut a1c as *mut _ as *mut c_void,
                 &mut a2  as *mut _ as *mut c_void,
                 &mut a3  as *mut _ as *mut c_void,
                 &mut a4  as *mut _ as *mut c_void,
@@ -292,7 +297,9 @@ impl CwtEngine {
         d_scalo.download_f32(&mut scalogram)?;
         let mut phase = vec![0.0f32; num_scales * width_pixels];
         d_phase.download_f32(&mut phase)?;
+        let mut coherence = vec![0.0f32; num_scales * width_pixels];
+        d_coher.download_f32(&mut coherence)?;
 
-        Ok((scalogram, phase))
+        Ok((scalogram, phase, coherence))
     }
 }

@@ -32,7 +32,7 @@ pub struct ComputeRequest {
 
 pub enum WorkerResult {
     Loaded(AudioFile),
-    Computed(Vec<(Vec<f32>, Vec<f32>)>),   // (amplitude, phase) per channel
+    Computed(Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>),  // (amplitude, phase, coherence) per channel
     Error(String),
 }
 
@@ -66,6 +66,7 @@ pub struct WaveletApp {
     // Scalogram data  [scale * width + col], one per channel
     scalograms:        Vec<Vec<f32>>,
     phases:            Vec<Vec<f32>>,
+    coherences:        Vec<Vec<f32>>,
     scalogram_width:   usize,
     textures:          Vec<Option<TextureHandle>>,
 
@@ -78,6 +79,7 @@ pub struct WaveletApp {
     params:       CwtParams,
     colormap:     ColorMap,
     display_mode: DisplayMode,
+    phase_gamma:   f32,    // coherence→saturation shaping for phase views
     log_amount:    f32,    // 0.0 = linear, 1.0 = logarithmic brightness
     vmin:          f32,    // brightness window low end (raw amplitude)
     vmax:          f32,    // brightness window high end (raw amplitude)
@@ -110,6 +112,7 @@ impl WaveletApp {
             audio:           None,
             scalograms:      Vec::new(),
             phases:          Vec::new(),
+            coherences:      Vec::new(),
             scalogram_width: 0,
             textures:        Vec::new(),
             viewport:        Viewport { t_start: 0.0, t_end: 1.0 },
@@ -120,6 +123,7 @@ impl WaveletApp {
             params:          CwtParams::default(),
             colormap:        ColorMap::Plasma,
             display_mode:    DisplayMode::Amplitude,
+            phase_gamma:     2.0,
             log_amount:      1.0,
             vmin:            0.0,
             vmax:            1.0,
@@ -173,16 +177,22 @@ impl WaveletApp {
         for (i, sc) in self.scalograms.iter().enumerate() {
             let num_scales = sc.len() / width;
             if num_scales == 0 { continue; }
-            let rgba = match (self.display_mode, self.phases.get(i)) {
-                (DisplayMode::Phase, Some(ph)) =>
-                    phase_to_rgba(ph, width, num_scales),
-                (DisplayMode::Combined, Some(ph)) =>
-                    combined_to_rgba(sc, ph, width, num_scales, vmin, vmax, self.log_amount),
+            let rgba = match (self.display_mode, self.phases.get(i), self.coherences.get(i)) {
+                (DisplayMode::Phase, Some(ph), Some(co)) =>
+                    phase_to_rgba(ph, co, width, num_scales, self.phase_gamma),
+                (DisplayMode::Combined, Some(ph), Some(co)) =>
+                    combined_to_rgba(sc, ph, co, width, num_scales, vmin, vmax, self.log_amount, self.phase_gamma),
                 _ =>
                     scalogram_to_rgba(sc, width, num_scales, self.colormap, vmin, vmax, self.log_amount),
             };
             let img  = egui::ColorImage::from_rgba_unmultiplied([width, num_scales], &rgba);
-            let tex  = ctx.load_texture("scalogram", img, egui::TextureOptions::LINEAR);
+            // Phase hue must not be bilinearly blended (wraps +π/−π through the
+            // whole wheel ⇒ false bands), so use NEAREST for phase-based views.
+            let opts = match self.display_mode {
+                DisplayMode::Amplitude => egui::TextureOptions::LINEAR,
+                _                      => egui::TextureOptions::NEAREST,
+            };
+            let tex  = ctx.load_texture("scalogram", img, opts);
             self.textures.push(Some(tex));
         }
     }
@@ -328,6 +338,16 @@ impl WaveletApp {
         ).changed() {
             let w = self.scalogram_width;
             if w > 0 { self.rebuild_textures(ctx); }
+        }
+
+        if matches!(self.display_mode, DisplayMode::Phase | DisplayMode::Combined) {
+            ui.label("Phase coherence γ (fade unresolved phase):");
+            if ui.add(
+                egui::Slider::new(&mut self.phase_gamma, 0.0..=6.0).text("γ"),
+            ).changed() {
+                let w = self.scalogram_width;
+                if w > 0 { self.rebuild_textures(ctx); }
+            }
         }
 
         ui.label("Brightness range:");
@@ -810,9 +830,17 @@ impl eframe::App for WaveletApp {
                     // drop the pan offset so it snaps cleanly into place.
                     self.tex_viewport    = self.pending_compute_viewport.clone();
                     self.panning         = false;
-                    let (scals, phs): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+                    let mut scals = Vec::with_capacity(results.len());
+                    let mut phs   = Vec::with_capacity(results.len());
+                    let mut cohs  = Vec::with_capacity(results.len());
+                    for (a, p, c) in results {
+                        scals.push(a);
+                        phs.push(p);
+                        cohs.push(c);
+                    }
                     self.scalograms      = scals;
                     self.phases          = phs;
+                    self.coherences      = cohs;
                     self.scalogram_width = self.last_width_px;
                     // Freeze the normalisation reference on the first compute
                     // after load; keep it stable across zoom / freq changes.
