@@ -71,6 +71,7 @@ impl CwtEngine {
     /// Returns `Vec<f32>` of length `params.num_scales * width_pixels`.
     /// Index: `scalogram[scale * width_pixels + col]`
     /// `scale = 0` → `f_min` (lowest freq), `scale = num_scales-1` → `f_max`.
+    #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &self,
         signal:      &[f32],
@@ -145,7 +146,7 @@ impl CwtEngine {
         }
 
         // Next power of two ≥ segment length, capped at 1 M to stay in VRAM
-        let n_fft = seg_ds_len.next_power_of_two().min(1 << 20).max(64);
+        let n_fft = seg_ds_len.next_power_of_two().clamp(64, 1 << 20);
 
         // ---- scales + per-scale ω₀ (log-spaced from f_min to f_max_eff) --
         // ω₀ is log-interpolated in frequency between omega0_low (at f_min)
@@ -202,10 +203,10 @@ impl CwtEngine {
         let bx: u32 = 256;
         let bxy_x: u32 = 32;
         let bxy_y: u32 = 8;
-        let gn  = ((n_fft      as u32) + bx    - 1) / bx;
-        let gkx = ((n_fft      as u32) + bxy_x - 1) / bxy_x;
-        let gky = ((num_scales as u32) + bxy_y - 1) / bxy_y;
-        let gex = ((width_pixels as u32) + bxy_x - 1) / bxy_x;
+        let gn  = (n_fft as u32).div_ceil(bx);
+        let gkx = (n_fft as u32).div_ceil(bxy_x);
+        let gky = (num_scales as u32).div_ceil(bxy_y);
+        let gex = (width_pixels as u32).div_ceil(bxy_x);
 
         // ---- 1. real → complex -------------------------------------------
         unsafe {

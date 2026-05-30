@@ -44,11 +44,11 @@ impl ColorMap {
     pub fn apply(self, t: f32) -> [u8; 3] {
         let t = t.clamp(0.0, 1.0);
         let (r, g, b) = match self {
-            ColorMap::Plasma  => lerp_colormap(t, &PLASMA),
-            ColorMap::Viridis => lerp_colormap(t, &VIRIDIS),
-            ColorMap::Magma   => lerp_colormap(t, &MAGMA),
-            ColorMap::Inferno => lerp_colormap(t, &INFERNO),
-            ColorMap::Hot     => lerp_colormap(t, &HOT),
+            ColorMap::Plasma  => lerp_colormap(t, PLASMA),
+            ColorMap::Viridis => lerp_colormap(t, VIRIDIS),
+            ColorMap::Magma   => lerp_colormap(t, MAGMA),
+            ColorMap::Inferno => lerp_colormap(t, INFERNO),
+            ColorMap::Hot     => lerp_colormap(t, HOT),
         };
         [
             (r.clamp(0.0, 1.0) * 255.0) as u8,
@@ -230,6 +230,7 @@ pub fn phase_to_rgba(
 
 /// Render phase as hue and amplitude as brightness ("domain colouring").
 /// Amplitude is normalised the same way as `scalogram_to_rgba`.
+#[allow(clippy::too_many_arguments)]
 pub fn combined_to_rgba(
     amplitude:  &[f32],
     phase:      &[f32],

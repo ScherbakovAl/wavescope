@@ -405,7 +405,7 @@ impl WaveletApp {
             if let Some(e) = &self.error_msg {
                 ui.colored_label(egui::Color32::RED, e);
             } else {
-                ui.label(&self.status.clone());
+                ui.label(self.status.clone());
             }
             if self.computing { ui.spinner(); }
             if let Some((t, f)) = self.hover_info {
