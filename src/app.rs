@@ -61,7 +61,10 @@ pub struct WaveletApp {
     textures:          Vec<Option<TextureHandle>>,
 
     // Viewport & parameters
-    viewport:     Viewport,
+    viewport:     Viewport,         // currently shown (effective) time window
+    tex_viewport: Viewport,         // window the current texture was computed for
+    pending_compute_viewport: Viewport, // window of the in-flight compute
+    panning:      bool,             // smooth pan in progress (drag + its recompute)
     params:       CwtParams,
     colormap:     ColorMap,
     display_mode: DisplayMode,
@@ -100,6 +103,9 @@ impl WaveletApp {
             scalogram_width: 0,
             textures:        Vec::new(),
             viewport:        Viewport { t_start: 0.0, t_end: 1.0 },
+            tex_viewport:    Viewport { t_start: 0.0, t_end: 1.0 },
+            pending_compute_viewport: Viewport { t_start: 0.0, t_end: 1.0 },
+            panning:         false,
             params:          CwtParams::default(),
             colormap:        ColorMap::Plasma,
             display_mode:    DisplayMode::Amplitude,
@@ -139,6 +145,7 @@ impl WaveletApp {
             antialias:    self.antialias,
         };
         let _ = self.work_tx.try_send(WorkerMsg::Compute(req));
+        self.pending_compute_viewport = self.viewport.clone();
         self.computing       = true;
         self.pending_compute = false;
         self.status          = "Computing…".into();
@@ -418,6 +425,14 @@ impl WaveletApp {
         self.hover_info = None;
         let mut viewport_changed = false;
         let mut new_viewport     = self.viewport.clone();
+
+        // While panning, slide the existing texture under the cursor instead of
+        // waiting for a recompute. Offset = how far the texture's window sits
+        // from the window we are now showing (in time), drawn as a pixel shift.
+        let pan_dt  = if self.panning {
+            self.tex_viewport.t_start - self.viewport.t_start
+        } else { 0.0 };
+        let pan_len = (self.viewport.t_end - self.viewport.t_start).max(1e-9);
         let mut new_f_min        = self.params.f_min;
         let mut new_f_max        = self.params.f_max;
 
@@ -440,18 +455,32 @@ impl WaveletApp {
                 egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
             );
 
-            // Draw scalogram texture (if available)
+            // Draw scalogram texture (if available), shifted by the pan offset.
+            // Revealed strips stay on the black background until the recompute
+            // for the new window arrives.
             if ch < self.textures.len() {
                 if let Some(tex) = &self.textures[ch] {
-                    ui.painter().image(
-                        tex.id(),
-                        rect,
-                        egui::Rect::from_min_max(
-                            egui::pos2(0.0, 0.0),
-                            egui::pos2(1.0, 1.0),
-                        ),
-                        egui::Color32::WHITE,
-                    );
+                    let w   = rect.width();
+                    let off = (pan_dt / pan_len * w as f64) as f32;
+                    if off.abs() < w {
+                        let (x0, x1, u0, u1) = if off >= 0.0 {
+                            (rect.min.x + off, rect.max.x, 0.0, (w - off) / w)
+                        } else {
+                            (rect.min.x, rect.max.x + off, -off / w, 1.0)
+                        };
+                        ui.painter().image(
+                            tex.id(),
+                            egui::Rect::from_min_max(
+                                egui::pos2(x0, rect.min.y),
+                                egui::pos2(x1, rect.max.y),
+                            ),
+                            egui::Rect::from_min_max(
+                                egui::pos2(u0, 0.0),
+                                egui::pos2(u1, 1.0),
+                            ),
+                            egui::Color32::WHITE,
+                        );
+                    }
                 }
             }
 
@@ -546,6 +575,7 @@ impl WaveletApp {
                 // FIX: apply delta to self.viewport each frame so that the
                 // accumulated pan is not lost between frames.
                 if response.dragged_by(egui::PointerButton::Primary) {
+                    self.panning = true;
                     let delta = response.drag_delta();
                     // Use current self.viewport (already committed) as base
                     let len = self.viewport.t_end - self.viewport.t_start;
@@ -619,6 +649,8 @@ impl eframe::App for WaveletApp {
                         t_start: 0.0,
                         t_end:   n as f64,
                     };
+                    self.tex_viewport = self.viewport.clone();
+                    self.panning      = false;
                     self.params.f_min = 20.0;
                     self.params.f_max = (audio.sample_rate as f32 / 2.0).min(20_000.0);
                     self.textures = vec![None; audio.channels.len()];
@@ -631,6 +663,10 @@ impl eframe::App for WaveletApp {
                 }
                 WorkerResult::Computed(results) => {
                     self.computing       = false;
+                    // The new texture matches the window it was computed for;
+                    // drop the pan offset so it snaps cleanly into place.
+                    self.tex_viewport    = self.pending_compute_viewport.clone();
+                    self.panning         = false;
                     let (scals, phs): (Vec<_>, Vec<_>) = results.into_iter().unzip();
                     self.scalograms      = scals;
                     self.phases          = phs;
