@@ -332,14 +332,6 @@ impl WaveletApp {
                 }
             });
 
-        ui.label("Amplitude brightness (linear ↔ log):");
-        if ui.add(
-            egui::Slider::new(&mut self.log_amount, 0.0..=1.0).text("log amount"),
-        ).changed() {
-            let w = self.scalogram_width;
-            if w > 0 { self.rebuild_textures(ctx); }
-        }
-
         if matches!(self.display_mode, DisplayMode::Phase | DisplayMode::Combined) {
             ui.label("Phase coherence γ (fade unresolved phase):");
             if ui.add(
@@ -350,13 +342,24 @@ impl WaveletApp {
             }
         }
 
+        ui.label("Amplitude brightness (linear ↔ log):");
+        if ui.add(
+            egui::Slider::new(&mut self.log_amount, 0.0..=1.0).text("log amount"),
+        ).changed() {
+            let w = self.scalogram_width;
+            if w > 0 { self.rebuild_textures(ctx); }
+        }
+
         ui.label("Brightness range:");
         let lo = self.data_min;
         let hi = self.data_max.max(self.data_min + 1e-12);
         let mut range_changed = false;
-        range_changed |= ui.add(
-            egui::Slider::new(&mut self.vmin, lo..=hi).text("vmin"),
-        ).changed();
+        // Shift = ultra-fine vmin tuning when dragging over the value box.
+        let mut vmin_slider = egui::Slider::new(&mut self.vmin, lo..=hi).text("vmin");
+        if ui.input(|i| i.modifiers.shift) {
+            vmin_slider = vmin_slider.drag_value_speed(0.00001);
+        }
+        range_changed |= ui.add(vmin_slider).changed();
         range_changed |= ui.add(
             egui::Slider::new(&mut self.vmax, lo..=hi).text("vmax"),
         ).changed();
