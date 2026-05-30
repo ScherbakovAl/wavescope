@@ -1,11 +1,6 @@
 use std::f64::consts::PI;
-use std::sync::Arc;
-use std::ffi::c_void;
 
-use crate::cuda::{
-    CudaContext, CudaModule, CudaFunction, CudaBuffer,
-    CufftPlan, CUFFT_FORWARD, CUFFT_INVERSE,
-};
+use crate::gpu::{ExtractParams, GpuContext, MulParams, WavParams};
 use crate::wavelet::CwtParams;
 
 // ---------------------------------------------------------------------------
@@ -49,25 +44,12 @@ fn lowpass_zero_phase(signal: &[f32], cutoff_hz: f64, sample_rate: f64, order: u
 pub type CwtOutput = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
 pub struct CwtEngine {
-    context:               Arc<CudaContext>,
-    fn_real_to_complex:    CudaFunction,
-    fn_wavelet_all_scales: CudaFunction,
-    fn_multiply:           CudaFunction,
-    fn_extract:            CudaFunction,
+    gpu: GpuContext,
 }
 
 impl CwtEngine {
-    pub fn new(
-        context: Arc<CudaContext>,
-        module:  &CudaModule,
-    ) -> anyhow::Result<Self> {
-        Ok(CwtEngine {
-            context,
-            fn_real_to_complex:    module.get_function("real_to_complex_kernel")?,
-            fn_wavelet_all_scales: module.get_function("wavelet_freq_all_scales_kernel")?,
-            fn_multiply:           module.get_function("multiply_signal_wavelets_kernel")?,
-            fn_extract:            module.get_function("extract_scalogram_kernel")?,
-        })
+    pub fn new(gpu: GpuContext) -> Self {
+        CwtEngine { gpu }
     }
 
     /// Compute the CWT scalogram for one audio channel.
@@ -175,158 +157,172 @@ impl CwtEngine {
         }
 
         // ---- GPU memory --------------------------------------------------
-        // cuFloatComplex = 2×f32 = 8 bytes
-        let bytes_f   = n_fft * 4;
-        let bytes_c   = n_fft * 8;
-        let bytes_sc  = num_scales * 4;
-        let bytes_all = num_scales * n_fft * 8;
-        let bytes_out = num_scales * width_pixels * 4;
+        // complex = 2×f32 = 8 bytes
+        let bytes_f   = (n_fft * 4) as u64;
+        let bytes_c   = (n_fft * 8) as u64;
+        let bytes_sc  = (num_scales * 4) as u64;
+        let bytes_all = (num_scales * n_fft * 8) as u64;
+        let bytes_out = (num_scales * width_pixels * 4) as u64;
 
-        let d_real    = CudaBuffer::alloc(bytes_f)?;
-        let d_complex = CudaBuffer::alloc(bytes_c)?;
-        let d_fft     = CudaBuffer::alloc(bytes_c)?;
-        let d_scales  = CudaBuffer::alloc(bytes_sc)?;
-        let d_eta     = CudaBuffer::alloc(bytes_sc)?;
-        let d_wfreqs  = CudaBuffer::alloc(bytes_all)?;
-        let d_prod    = CudaBuffer::alloc(bytes_all)?;
-        let d_cwt     = CudaBuffer::alloc(bytes_all)?;
-        let d_scalo   = CudaBuffer::alloc(bytes_out)?;
-        let d_phase   = CudaBuffer::alloc(bytes_out)?;
-        let d_coher   = CudaBuffer::alloc(bytes_out)?;
-        let d_instdev = CudaBuffer::alloc(bytes_out)?;
+        let gpu = &self.gpu;
+        let d_real    = gpu.storage(bytes_f);
+        let d_complex = gpu.storage(bytes_c);
+        let d_fft     = gpu.storage(bytes_c);
+        let d_scratch = gpu.storage(bytes_c);   // forward-FFT ping-pong partner
+        let d_scales  = gpu.storage(bytes_sc);
+        let d_eta     = gpu.storage(bytes_sc);
+        let d_wfreqs  = gpu.storage(bytes_all);
+        let d_prod    = gpu.storage(bytes_all);
+        let d_cwt     = gpu.storage(bytes_all);
+        let d_scalo   = gpu.storage(bytes_out);
+        let d_phase   = gpu.storage(bytes_out);
+        let d_coher   = gpu.storage(bytes_out);
+        let d_instdev = gpu.storage(bytes_out);
 
         // ---- upload -------------------------------------------------------
         let mut padded = vec![0.0f32; n_fft];
         let copy_len = seg_ds_len.min(n_fft);
         padded[..copy_len].copy_from_slice(&segment_ds[..copy_len]);
-        d_real.upload_f32(&padded)?;
-        d_scales.upload_f32(&scales)?;
-        d_eta.upload_f32(&etas)?;
+        gpu.upload_f32(&d_real, &padded);
+        gpu.upload_f32(&d_scales, &scales);
+        gpu.upload_f32(&d_eta, &etas);
 
-        // ---- kernel helpers ----------------------------------------------
-        let n32      = n_fft as i32;
-        let ns32     = num_scales as i32;
-        let wp32     = width_pixels as i32;
-        let vs32     = valid_start as i32;
-        let ve32     = valid_end   as i32;
-        let kind32   = params.kind.code();
-        let (p1, p2) = params.kernel_params();
+        let n32        = n_fft as u32;
+        let ns32       = num_scales as u32;
+        let (p1, p2)   = params.kernel_params();
+        let kind32     = params.kind.code() as u32;
 
-        let bx: u32 = 256;
-        let bxy_x: u32 = 32;
-        let bxy_y: u32 = 8;
-        let gn  = (n_fft as u32).div_ceil(bx);
-        let gkx = (n_fft as u32).div_ceil(bxy_x);
-        let gky = (num_scales as u32).div_ceil(bxy_y);
-        let gex = (width_pixels as u32).div_ceil(bxy_x);
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         // ---- 1. real → complex -------------------------------------------
-        unsafe {
-            let mut a0 = d_real.ptr();
-            let mut a1 = d_complex.ptr();
-            let mut a2 = n32;
-            let mut p: [*mut c_void; 3] = [
-                &mut a0 as *mut _ as *mut c_void,
-                &mut a1 as *mut _ as *mut c_void,
-                &mut a2 as *mut _ as *mut c_void,
-            ];
-            self.fn_real_to_complex.launch((gn, 1, 1), (bx, 1, 1), &mut p)?;
-        }
+        gpu.real_to_complex(&mut enc, &d_real, &d_complex, n32);
 
-        // ---- 2. forward FFT ----------------------------------------------
-        let plan_fwd = CufftPlan::plan_single_c2c(n_fft)?;
-        plan_fwd.exec_c2c(d_complex.ptr(), d_fft.ptr(), CUFFT_FORWARD)?;
+        // ---- 2. forward FFT (d_complex → d_fft) --------------------------
+        gpu.fft(&mut enc, &d_complex, &d_fft, &d_scratch, n32, 1, false);
 
         // ---- 3. wavelet in frequency domain for all scales ---------------
-        unsafe {
-            let mut a0 = d_wfreqs.ptr();
-            let mut a1 = d_scales.ptr();
-            let mut a2 = n32;
-            let mut a3 = ns32;
-            let mut a4 = d_eta.ptr();
-            let mut a5 = kind32;
-            let mut a6 = p1;
-            let mut a7 = p2;
-            let mut p: [*mut c_void; 8] = [
-                &mut a0 as *mut _ as *mut c_void,
-                &mut a1 as *mut _ as *mut c_void,
-                &mut a2 as *mut _ as *mut c_void,
-                &mut a3 as *mut _ as *mut c_void,
-                &mut a4 as *mut _ as *mut c_void,
-                &mut a5 as *mut _ as *mut c_void,
-                &mut a6 as *mut _ as *mut c_void,
-                &mut a7 as *mut _ as *mut c_void,
-            ];
-            self.fn_wavelet_all_scales
-                .launch((gkx, gky, 1), (bxy_x, bxy_y, 1), &mut p)?;
-        }
+        gpu.wavelet(
+            &mut enc,
+            &d_wfreqs,
+            &d_scales,
+            &d_eta,
+            WavParams { n: n32, num_scales: ns32, kind: kind32, p1, p2, _pad: [0; 3] },
+        );
 
-        // ---- 4. multiply signal_fft × wavelet_freqs ---------------------
-        unsafe {
-            let mut a0 = d_fft.ptr();
-            let mut a1 = d_wfreqs.ptr();
-            let mut a2 = d_prod.ptr();
-            let mut a3 = n32;
-            let mut a4 = ns32;
-            let mut p: [*mut c_void; 5] = [
-                &mut a0 as *mut _ as *mut c_void,
-                &mut a1 as *mut _ as *mut c_void,
-                &mut a2 as *mut _ as *mut c_void,
-                &mut a3 as *mut _ as *mut c_void,
-                &mut a4 as *mut _ as *mut c_void,
-            ];
-            self.fn_multiply
-                .launch((gkx, gky, 1), (bxy_x, bxy_y, 1), &mut p)?;
-        }
+        // ---- 4. multiply signal_fft × wavelet_freqs ----------------------
+        gpu.multiply(
+            &mut enc,
+            &d_fft,
+            &d_wfreqs,
+            &d_prod,
+            MulParams { n: n32, num_scales: ns32, _pad: [0; 2] },
+        );
 
-        // ---- 5. batch IFFT (one per scale) -------------------------------
-        let plan_inv = CufftPlan::plan_batch_c2c(n_fft, num_scales)?;
-        plan_inv.exec_c2c(d_prod.ptr(), d_cwt.ptr(), CUFFT_INVERSE)?;
+        // ---- 5. batch IFFT (one per scale). d_wfreqs is free now and
+        //         doubles as the ping-pong scratch. -----------------------
+        gpu.fft(&mut enc, &d_prod, &d_cwt, &d_wfreqs, n32, ns32, true);
 
         // ---- 6. extract scalogram ----------------------------------------
-        unsafe {
-            let mut a0  = d_cwt.ptr();
-            let mut a1  = d_scalo.ptr();
-            let mut a1p = d_phase.ptr();
-            let mut a1c = d_coher.ptr();
-            let mut a1d = d_instdev.ptr();
-            let mut a1s = d_scales.ptr();
-            let mut a1o = d_eta.ptr();
-            let mut a2  = n32;
-            let mut a3  = ns32;
-            let mut a4  = vs32;
-            let mut a5  = ve32;
-            let mut a6  = wp32;
-            let mut p: [*mut c_void; 12] = [
-                &mut a0  as *mut _ as *mut c_void,
-                &mut a1  as *mut _ as *mut c_void,
-                &mut a1p as *mut _ as *mut c_void,
-                &mut a1c as *mut _ as *mut c_void,
-                &mut a1d as *mut _ as *mut c_void,
-                &mut a1s as *mut _ as *mut c_void,
-                &mut a1o as *mut _ as *mut c_void,
-                &mut a2  as *mut _ as *mut c_void,
-                &mut a3  as *mut _ as *mut c_void,
-                &mut a4  as *mut _ as *mut c_void,
-                &mut a5  as *mut _ as *mut c_void,
-                &mut a6  as *mut _ as *mut c_void,
-            ];
-            self.fn_extract
-                .launch((gex, gky, 1), (bxy_x, bxy_y, 1), &mut p)?;
-        }
+        gpu.extract(
+            &mut enc,
+            &d_cwt,
+            &d_scalo,
+            &d_phase,
+            &d_coher,
+            &d_instdev,
+            &d_scales,
+            &d_eta,
+            ExtractParams {
+                n: n32,
+                num_scales: ns32,
+                valid_start: valid_start as i32,
+                valid_end: valid_end as i32,
+                width: width_pixels as u32,
+                _pad: [0; 3],
+            },
+        );
 
-        self.context.synchronize()?;
+        // ---- copy outputs to mappable staging buffers --------------------
+        let s_scalo   = gpu.staging(bytes_out);
+        let s_phase   = gpu.staging(bytes_out);
+        let s_coher   = gpu.staging(bytes_out);
+        let s_instdev = gpu.staging(bytes_out);
+        enc.copy_buffer_to_buffer(&d_scalo,   0, &s_scalo,   0, bytes_out);
+        enc.copy_buffer_to_buffer(&d_phase,   0, &s_phase,   0, bytes_out);
+        enc.copy_buffer_to_buffer(&d_coher,   0, &s_coher,   0, bytes_out);
+        enc.copy_buffer_to_buffer(&d_instdev, 0, &s_instdev, 0, bytes_out);
+
+        gpu.queue.submit(Some(enc.finish()));
 
         // ---- download ----------------------------------------------------
-        let mut scalogram = vec![0.0f32; num_scales * width_pixels];
-        d_scalo.download_f32(&mut scalogram)?;
-        let mut phase = vec![0.0f32; num_scales * width_pixels];
-        d_phase.download_f32(&mut phase)?;
-        let mut coherence = vec![0.0f32; num_scales * width_pixels];
-        d_coher.download_f32(&mut coherence)?;
-        let mut inst_dev = vec![0.0f32; num_scales * width_pixels];
-        d_instdev.download_f32(&mut inst_dev)?;
+        let n_out = num_scales * width_pixels;
+        let scalogram = gpu.download_f32(&s_scalo,   n_out);
+        let phase     = gpu.download_f32(&s_phase,   n_out);
+        let coherence = gpu.download_f32(&s_coher,   n_out);
+        let inst_dev  = gpu.download_f32(&s_instdev, n_out);
 
         Ok((scalogram, phase, coherence, inst_dev))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end test: a pure tone must light up the scalogram row whose centre
+// frequency matches the tone. Exercises the whole GPU pipeline (real→complex,
+// FFT, wavelet, multiply, batch IFFT, extract). Skips if no GPU adapter.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wavelet::{CwtParams, WaveletKind};
+
+    #[test]
+    fn scalogram_peaks_at_tone_frequency() {
+        let gpu = match GpuContext::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping GPU test (no adapter): {e}");
+                return;
+            }
+        };
+        let engine = CwtEngine::new(gpu);
+
+        let sr = 44_100u32;
+        let f0 = 2_000.0f64;
+        let n = 16_384usize;
+        let signal: Vec<f32> = (0..n)
+            .map(|i| (2.0 * PI * f0 * i as f64 / sr as f64).sin() as f32)
+            .collect();
+
+        let params = CwtParams {
+            num_scales: 96,
+            f_min: 500.0,
+            f_max: 8_000.0,
+            kind: WaveletKind::Morlet,
+            omega0_low: 6.0,
+            omega0_high: 6.0,
+            ..CwtParams::default()
+        };
+        let width = 16usize;
+        let (scalo, _p, _c, _d) = engine
+            .compute(&signal, sr, 0, n, width, &params, false)
+            .expect("compute failed");
+
+        // Row with the most energy summed across columns.
+        let ns = params.num_scales;
+        let (mut best, mut best_v) = (0usize, f32::MIN);
+        for s in 0..ns {
+            let sum: f32 = (0..width).map(|c| scalo[s * width + c]).sum();
+            if sum > best_v {
+                best_v = sum;
+                best = s;
+            }
+        }
+        let frac = best as f64 / (ns - 1) as f64;
+        let f_peak = params.f_min as f64 * (params.f_max as f64 / params.f_min as f64).powf(frac);
+        let rel = (f_peak - f0).abs() / f0;
+        assert!(rel < 0.12, "peak row freq {f_peak:.1} Hz vs {f0} Hz (rel {rel:.3})");
     }
 }

@@ -28,7 +28,7 @@ impl WaveletKind {
         }
     }
 
-    /// Integer code passed to the CUDA generation kernel.
+    /// Integer code passed to the wavelet-generation compute kernel.
     pub fn code(self) -> i32 {
         match self {
             WaveletKind::Morlet => 0,

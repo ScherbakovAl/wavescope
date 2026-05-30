@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 
 use egui::TextureHandle;
 
@@ -8,7 +8,7 @@ use crate::colormap::{
     combined_to_rgba, instfreq_to_rgba, phase_to_rgba, scalogram_to_rgba,
     ColorMap, DisplayMode, InstFreqBaseline,
 };
-use crate::cuda::CudaContext;
+use crate::gpu::GpuContext;
 use crate::cwt::{CwtEngine, CwtOutput};
 use crate::wavelet::{CwtParams, WaveletKind};
 
@@ -107,11 +107,11 @@ pub struct WaveletApp {
 }
 
 impl WaveletApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, ptx_code: String) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (work_tx, work_rx) = mpsc::sync_channel::<WorkerMsg>(8);
         let (res_tx,  res_rx)  = mpsc::sync_channel::<WorkerResult>(8);
 
-        std::thread::spawn(move || worker_thread(work_rx, res_tx, ptx_code));
+        std::thread::spawn(move || worker_thread(work_rx, res_tx));
 
         WaveletApp {
             audio:           None,
@@ -992,29 +992,15 @@ impl eframe::App for WaveletApp {
 fn worker_thread(
     rx: mpsc::Receiver<WorkerMsg>,
     tx: mpsc::SyncSender<WorkerResult>,
-    ptx_code: String,
 ) {
-    let ctx = match CudaContext::init() {
-        Ok(c)  => Arc::new(c),
+    let gpu = match GpuContext::new() {
+        Ok(g)  => g,
         Err(e) => {
-            let _ = tx.send(WorkerResult::Error(format!("CUDA init: {}", e)));
+            let _ = tx.send(WorkerResult::Error(format!("GPU init: {}", e)));
             return;
         }
     };
-    let module = match ctx.load_ptx(&ptx_code) {
-        Ok(m)  => m,
-        Err(e) => {
-            let _ = tx.send(WorkerResult::Error(format!("PTX load: {}", e)));
-            return;
-        }
-    };
-    let engine = match CwtEngine::new(Arc::clone(&ctx), &module) {
-        Ok(e)  => e,
-        Err(e) => {
-            let _ = tx.send(WorkerResult::Error(format!("CwtEngine: {}", e)));
-            return;
-        }
-    };
+    let engine = CwtEngine::new(gpu);
 
     for msg in rx.iter() {
         // For Compute messages, drain the queue and keep only the latest
