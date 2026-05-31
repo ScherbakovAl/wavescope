@@ -41,4 +41,4 @@ jobs:
       # The GPU tests themselves need a real adapter and are run locally / on the
       # macOS runner where Metal is available; without an adapter they self-skip.
       - name: Clippy (compile + lint, all targets)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings

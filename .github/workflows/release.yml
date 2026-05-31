@@ -53,7 +53,7 @@ jobs:
       # -------- Linux --------
       - name: Build (Linux)
         if: runner.os == 'Linux'
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
@@ -66,7 +66,7 @@ jobs:
       # -------- Windows --------
       - name: Build (Windows)
         if: runner.os == 'Windows'
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -84,8 +84,8 @@ jobs:
       - name: Build universal binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
           lipo -create -output "target/${BIN}-universal" \
             "target/aarch64-apple-darwin/release/${BIN}" \
             "target/x86_64-apple-darwin/release/${BIN}"
