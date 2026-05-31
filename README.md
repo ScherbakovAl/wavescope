@@ -6,6 +6,15 @@ GPU-accelerated continuous-wavelet-transform (CWT) viewer for WAV/FLAC audio.
 Interactive scalogram with zoom/pan and amplitude / phase / instantaneous-frequency
 views.
 
+Four analytic wavelet families to analyse with:
+
+- **Morlet** — Gaussian in frequency, classic balanced time/frequency.
+- **Generalized Morse** — two knobs (β, γ) tune symmetry and the time/frequency
+  trade-off independently; generalises Morlet and Paul.
+- **Bump** — compact in frequency ⇒ very sharp frequency lines, good for close
+  stationary tones.
+- **Paul** — excellent time localisation ⇒ good for transients and onsets.
+
 Cross-platform via [`wgpu`](https://github.com/gfx-rs/wgpu): compute runs on
 Vulkan (Linux/Windows), Metal (macOS) or DX12 (Windows), so it works on NVIDIA,
 AMD, Intel and Apple GPUs.
