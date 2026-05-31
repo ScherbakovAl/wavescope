@@ -10,8 +10,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BIN: wavelet_sonnet
-  APP_NAME: Wavelet Audio Analyzer
+  BIN: wavescope
+  APP_NAME: Wavescope
 
 jobs:
   build:

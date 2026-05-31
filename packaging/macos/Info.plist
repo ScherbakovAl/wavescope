@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Wavelet Audio Analyzer</string>
+    <string>Wavescope</string>
     <key>CFBundleDisplayName</key>
-    <string>Wavelet Audio Analyzer</string>
+    <string>Wavescope</string>
     <key>CFBundleIdentifier</key>
-    <string>com.scherbakov.wavelet-sonnet</string>
+    <string>com.scherbakov.wavescope</string>
     <key>CFBundleExecutable</key>
-    <string>wavelet_sonnet</string>
+    <string>wavescope</string>
     <key>CFBundleVersion</key>
     <string>__VERSION__</string>
     <key>CFBundleShortVersionString</key>

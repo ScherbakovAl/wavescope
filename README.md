@@ -1,4 +1,6 @@
-# Wavelet Audio Analyzer
+# Wavescope
+
+*A GPU wavelet scalogram viewer for audio.*
 
 GPU-accelerated continuous-wavelet-transform (CWT) viewer for WAV/FLAC audio.
 Interactive scalogram with zoom/pan and amplitude / phase / instantaneous-frequency
@@ -13,13 +15,13 @@ AMD, Intel and Apple GPUs.
 Prebuilt binaries for Linux, Windows and macOS are attached to each
 [GitHub Release](../../releases):
 
-- **Linux** — `…-linux-x86_64.tar.gz` (extract and run `wavelet_sonnet`)
-- **Windows** — `…-windows-x86_64.zip` (extract and run `wavelet_sonnet.exe`)
+- **Linux** — `…-linux-x86_64.tar.gz` (extract and run `wavescope`)
+- **Windows** — `…-windows-x86_64.zip` (extract and run `wavescope.exe`)
 - **macOS** — `…-macos-universal.zip` (universal Intel + Apple Silicon `.app`)
 
 > **macOS:** the app is **not code-signed**. On first launch macOS Gatekeeper
 > will block it — right-click the app → **Open** → **Open**, or run
-> `xattr -dr com.apple.quarantine "Wavelet Audio Analyzer.app"`.
+> `xattr -dr com.apple.quarantine "Wavescope.app"`.
 
 A GPU with a Vulkan / Metal / DX12 driver is required.
 
@@ -29,7 +31,7 @@ Requires a stable Rust toolchain.
 
 ```sh
 cargo build --release
-# binary at target/release/wavelet_sonnet
+# binary at target/release/wavescope
 ```
 
 ### Linux build dependencies

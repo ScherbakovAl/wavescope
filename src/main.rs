@@ -12,13 +12,13 @@ fn main() -> anyhow::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Wavelet Audio Analyzer")
+            .with_title("Wavescope")
             .with_inner_size([1440.0, 860.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Wavelet Audio Analyzer",
+        "Wavescope",
         native_options,
         Box::new(|cc| Ok(Box::new(WaveletApp::new(cc)))),
     )

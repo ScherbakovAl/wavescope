@@ -3748,7 +3748,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wavelet_sonnet"
+name = "wavescope"
 version = "0.1.0"
 dependencies = [
  "anyhow",
