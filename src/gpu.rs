@@ -96,7 +96,7 @@ pub struct GpuContext {
 const WG: u32 = 64;
 
 fn ceil_div(a: u32, b: u32) -> u32 {
-    (a + b - 1) / b
+    a.div_ceil(b)
 }
 
 impl GpuContext {
@@ -347,6 +347,7 @@ impl GpuContext {
     /// partner (must hold `batch * n` complex elements). Forward is unnormalised;
     /// inverse is also unnormalised (the 1/N scaling is applied in `extract`),
     /// matching cuFFT's convention.
+    #[allow(clippy::too_many_arguments)]
     pub fn fft(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -766,10 +767,9 @@ mod tests {
         let out = run_fft(&gpu, &input, n as u32, batch as u32, false);
         for (b, row) in rows.iter().enumerate() {
             let expect = naive_dft(row, false);
-            for k in 0..n {
+            for (k, &(er, ei)) in expect.iter().enumerate() {
                 let idx = b * n + k;
                 let (gr, gi) = (out[2 * idx] as f64, out[2 * idx + 1] as f64);
-                let (er, ei) = expect[k];
                 assert!(
                     (gr - er).abs() < 1e-3 && (gi - ei).abs() < 1e-3,
                     "b={b} k={k}: gpu=({gr:.4},{gi:.4}) dft=({er:.4},{ei:.4})"
