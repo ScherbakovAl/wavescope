@@ -1,5 +1,7 @@
 # Wavescope
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20573387.svg)](https://doi.org/10.5281/zenodo.20573387)
+
 *A GPU wavelet scalogram viewer for audio.*
 
 GPU-accelerated continuous-wavelet-transform (CWT) viewer for WAV/FLAC audio.
@@ -74,3 +76,25 @@ git push origin v0.1.0
 
 `.github/workflows/ci.yml` compiles and lints (`clippy -D warnings`) on Linux,
 Windows and macOS for every push / pull request.
+
+## Citation
+
+If you use Wavescope in your research, please cite it via its archived
+[Zenodo record](https://doi.org/10.5281/zenodo.20573387):
+
+```bibtex
+@software{wavescope,
+  author    = {Scherbakov, Alexey},
+  title     = {Wavescope: A GPU Wavelet Scalogram Viewer for Audio},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.20573387},
+  url       = {https://doi.org/10.5281/zenodo.20573387}
+}
+```
+
+The DOI `10.5281/zenodo.20573387` always resolves to the latest release.
+
+## License
+
+Released under the [MIT License](LICENSE).
