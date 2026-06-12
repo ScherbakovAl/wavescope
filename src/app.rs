@@ -994,31 +994,29 @@ impl WaveletApp {
                         new_viewport.t_start = ts;
                         new_viewport.t_end   = te;
                         viewport_changed = true;
-                    } else if scroll.y.abs() > 0.5 {
-                        if !modifiers.ctrl && !modifiers.command {
-                            // Zoom time axis around cursor. Skip when Ctrl is
-                            // held: Ctrl+wheel already zooms frequency via
-                            // zoom_delta above, and some platforms also report a
-                            // raw scroll delta that would otherwise zoom time.
-                            let zoom = if scroll.y > 0.0 { 0.85f64 } else { 1.0 / 0.85 };
-                            let rx = response
-                                .hover_pos()
-                                .map(|p| {
-                                    ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0) as f64
-                                })
-                                .unwrap_or(0.5);
-                            let cur = new_viewport.t_start
-                                + rx * (new_viewport.t_end - new_viewport.t_start);
-                            new_viewport.t_start =
-                                (cur - (cur - new_viewport.t_start) * zoom).max(0.0);
-                            new_viewport.t_end =
-                                (cur + (new_viewport.t_end - cur) * zoom)
-                                    .min(total_samp as f64);
-                            if new_viewport.t_end - new_viewport.t_start < 8.0 {
-                                new_viewport.t_end = new_viewport.t_start + 8.0;
-                            }
-                            viewport_changed = true;
+                    } else if scroll.y.abs() > 0.5 && !modifiers.ctrl && !modifiers.command {
+                        // Zoom time axis around cursor. Skip when Ctrl is held:
+                        // Ctrl+wheel already zooms frequency via zoom_delta
+                        // above, and some platforms also report a raw scroll
+                        // delta that would otherwise zoom time.
+                        let zoom = if scroll.y > 0.0 { 0.85f64 } else { 1.0 / 0.85 };
+                        let rx = response
+                            .hover_pos()
+                            .map(|p| {
+                                ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0) as f64
+                            })
+                            .unwrap_or(0.5);
+                        let cur = new_viewport.t_start
+                            + rx * (new_viewport.t_end - new_viewport.t_start);
+                        new_viewport.t_start =
+                            (cur - (cur - new_viewport.t_start) * zoom).max(0.0);
+                        new_viewport.t_end =
+                            (cur + (new_viewport.t_end - cur) * zoom)
+                                .min(total_samp as f64);
+                        if new_viewport.t_end - new_viewport.t_start < 8.0 {
+                            new_viewport.t_end = new_viewport.t_start + 8.0;
                         }
+                        viewport_changed = true;
                     }
                 }
 
