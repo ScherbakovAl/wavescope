@@ -652,10 +652,9 @@ impl WaveletApp {
         let hi = self.data_max.max(self.data_min + 1e-12);
         let mut range_changed = false;
         // Shift = ultra-fine vmin tuning when dragging over the value box.
-        let mut vmin_slider = egui::Slider::new(&mut self.vmin, lo..=hi).text("vmin");
-        if ui.input(|i| i.modifiers.shift) {
-            vmin_slider = vmin_slider.drag_value_speed(0.00001);
-        }
+        let vmin_speed = if ui.input(|i| i.modifiers.shift) { 0.000001 } else { 0.00001 };
+        let vmin_slider = egui::Slider::new(&mut self.vmin, lo..=hi).text("vmin")
+            .drag_value_speed(vmin_speed);
         range_changed |= ui.add(vmin_slider).changed();
         range_changed |= ui.add(
             egui::Slider::new(&mut self.vmax, lo..=hi).text("vmax"),
@@ -717,7 +716,7 @@ impl WaveletApp {
         ui.label("Ctrl+Scroll         – zoom freq axis");
         ui.label("Shift+Scroll        – pan freq");
         ui.label("Alt+Scroll          – pan time");
-        ui.label("Drag                – pan");
+        ui.label("Drag                – pan time");
         ui.label("Double-click        – pick ridge");
         ui.label("Right-click         – reset view");
 
@@ -761,7 +760,7 @@ impl WaveletApp {
                 ui.label(
                     "Open a WAV or FLAC audio file to begin.\n\n\
                      Scroll to zoom time • Ctrl+Scroll to zoom frequency\n\
-                     Shift+Scroll to pan freq • Alt+Scroll to pan time • Drag to pan\n\
+                     Shift+Scroll to pan freq • Alt+Scroll to pan time • Drag to pan time\n\
                      Double-click to pick a ridge • Right-click to reset view",
                 );
             });

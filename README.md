@@ -39,9 +39,12 @@ VRAM budget.
 
 ## Controls
 
-- **Scroll** — zoom time axis · **Ctrl/Shift+Scroll** — zoom frequency axis
-- **Alt+Scroll** — pan time · **Drag** — pan
+- **Scroll** — zoom time axis · **Ctrl+Scroll** — zoom frequency axis (at cursor)
+- **Shift+Scroll** — pan frequency · **Alt+Scroll** — pan time · **Drag** — pan time
 - **Double-click** — pick a ridge · **Right-click** — reset view
+
+Zoom is centred on the cursor. On macOS the frequency zoom also responds to
+⌘+Scroll and to a trackpad pinch.
 
 Cross-platform via [`wgpu`](https://github.com/gfx-rs/wgpu): compute runs on
 Vulkan (Linux/Windows), Metal (macOS) or DX12 (Windows), so it works on NVIDIA,
