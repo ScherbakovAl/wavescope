@@ -76,6 +76,20 @@ fn zoom_freq(ry: f64, zoom: f64, f_min: f64, f_max: f64) -> (f32, f32) {
     (lo, hi)
 }
 
+/// Log-space frequency pan. `pan_pts` > 0 shifts the window toward higher
+/// frequency. The span is preserved; the shift is clamped at the limits so the
+/// window cannot grow or shrink. Returns the new (f_min, f_max).
+fn pan_freq(pan_pts: f64, f_min: f64, f_max: f64) -> (f32, f32) {
+    let log_lo = f_min.ln();
+    let log_hi = f_max.ln();
+    let lo_lim = 0.5f64.ln();
+    let hi_lim = 22_050.0f64.ln();
+    let d = (pan_pts * 0.002 * (log_hi - log_lo))
+        .min(hi_lim - log_hi)
+        .max(lo_lim - log_lo);
+    ((log_lo + d).exp() as f32, (log_hi + d).exp() as f32)
+}
+
 // What the user is currently dragging on the time scrollbar.
 #[derive(Clone, Copy, PartialEq)]
 enum ScrollbarDrag {
@@ -700,7 +714,8 @@ impl WaveletApp {
         ui.separator();
         ui.label("Interactions:");
         ui.label("Scroll              – zoom time axis");
-        ui.label("Ctrl/Shift+Scroll   – zoom freq axis");
+        ui.label("Ctrl+Scroll         – zoom freq axis");
+        ui.label("Shift+Scroll        – pan freq");
         ui.label("Alt+Scroll          – pan time");
         ui.label("Drag                – pan");
         ui.label("Double-click        – pick ridge");
@@ -745,8 +760,8 @@ impl WaveletApp {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     "Open a WAV or FLAC audio file to begin.\n\n\
-                     Scroll to zoom time • Ctrl/Shift+Scroll to zoom frequency\n\
-                     Alt+Scroll to pan • Drag to pan\n\
+                     Scroll to zoom time • Ctrl+Scroll to zoom frequency\n\
+                     Shift+Scroll to pan freq • Alt+Scroll to pan time • Drag to pan\n\
                      Double-click to pick a ridge • Right-click to reset view",
                 );
             });
@@ -931,7 +946,7 @@ impl WaveletApp {
                 //   plain        – zoom time axis around cursor
                 //   Ctrl (pinch) – zoom freq axis (egui-winit reports it as
                 //                  zoom_delta and zeros raw_scroll_delta)
-                //   Shift        – zoom freq axis
+                //   Shift        – pan freq axis
                 //   Alt / horizontal wheel – pan time
                 if response.hovered() {
                     let (scroll, modifiers, zoomf) =
@@ -951,7 +966,22 @@ impl WaveletApp {
                     }
 
                     let pan_pts = if modifiers.alt { scroll.y } else { 0.0 } + scroll.x;
-                    if pan_pts.abs() > 0.5 {
+                    if modifiers.shift {
+                        // Shift+wheel: pan frequency (like Alt+wheel pans time).
+                        // Many platforms deliver Shift+wheel as a horizontal
+                        // scroll, so take whichever axis carries the delta.
+                        let wheel = if scroll.y.abs() >= scroll.x.abs() {
+                            scroll.y
+                        } else {
+                            scroll.x
+                        };
+                        if wheel.abs() > 0.5 {
+                            let (lo, hi) = pan_freq(wheel as f64, f_min, f_max);
+                            new_f_min = lo;
+                            new_f_max = hi;
+                            viewport_changed = true;
+                        }
+                    } else if pan_pts.abs() > 0.5 {
                         // Pan: one wheel notch (~50 pt) ≈ 10 % of the window.
                         let len = new_viewport.t_end - new_viewport.t_start;
                         let dt  = -(pan_pts as f64) * 0.002 * len;
@@ -965,14 +995,12 @@ impl WaveletApp {
                         new_viewport.t_end   = te;
                         viewport_changed = true;
                     } else if scroll.y.abs() > 0.5 {
-                        let zoom = if scroll.y > 0.0 { 0.85f64 } else { 1.0 / 0.85 };
-
-                        if modifiers.shift {
-                            let (lo, hi) = zoom_freq(ry, zoom, f_min, f_max);
-                            new_f_min = lo;
-                            new_f_max = hi;
-                        } else {
-                            // Zoom time axis around cursor
+                        if !modifiers.ctrl && !modifiers.command {
+                            // Zoom time axis around cursor. Skip when Ctrl is
+                            // held: Ctrl+wheel already zooms frequency via
+                            // zoom_delta above, and some platforms also report a
+                            // raw scroll delta that would otherwise zoom time.
+                            let zoom = if scroll.y > 0.0 { 0.85f64 } else { 1.0 / 0.85 };
                             let rx = response
                                 .hover_pos()
                                 .map(|p| {
@@ -989,8 +1017,8 @@ impl WaveletApp {
                             if new_viewport.t_end - new_viewport.t_start < 8.0 {
                                 new_viewport.t_end = new_viewport.t_start + 8.0;
                             }
+                            viewport_changed = true;
                         }
-                        viewport_changed = true;
                     }
                 }
 
