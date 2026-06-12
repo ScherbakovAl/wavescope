@@ -632,7 +632,10 @@ mod tests {
 
         for unweighted in [false, true] {
             let (outs, _) = engine
-                .compute_all(&[signal.clone()], sr, 0, n, width, &params, true, unweighted)
+                .compute_all(
+                    std::slice::from_ref(&signal),
+                    sr, 0, n, width, &params, true, unweighted,
+                )
                 .expect("compute failed");
             let (scalo, _ph, _co, dev) = &outs[0];
             let ns = params.num_scales;
