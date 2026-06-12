@@ -5,9 +5,10 @@
 *A GPU wavelet scalogram viewer for audio.*
 
 GPU-accelerated continuous-wavelet-transform (CWT) viewer for WAV/FLAC audio.
-Interactive scalogram with zoom/pan and amplitude / phase / instantaneous-frequency
-/ cross-channel-phase views, built for hunting subtle phase dynamics
-(oscillator synchronisation, frequency pulling, phase slips).
+Interactive scalogram with zoom/pan and amplitude / synchrosqueezed / superlet
+/ phase / instantaneous-frequency / cross-channel-phase views, built for
+hunting subtle phase dynamics (oscillator synchronisation, frequency pulling,
+phase slips).
 
 Four analytic wavelet families to analyse with:
 
@@ -17,6 +18,16 @@ Four analytic wavelet families to analyse with:
 - **Bump** — compact in frequency ⇒ very sharp frequency lines, good for close
   stationary tones.
 - **Paul** — excellent time localisation ⇒ good for transients and onsets.
+
+## Sharpened amplitude views
+
+- **Synchrosqueezed** — amplitude reassigned along the frequency axis to each
+  pixel's instantaneous frequency: ridges of quasi-harmonic components
+  collapse to ~1-row lines. Display-side post-processing, no extra compute.
+- **Superlet** — geometric mean of amplitudes over CWT passes with the
+  wavelet's frequency-sharpness parameter scaled ×1…×order (multiplicative
+  superlets, Moca et al. 2021). Sharper in both axes; costs *order* compute
+  passes.
 
 ## Phase analysis
 

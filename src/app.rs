@@ -9,7 +9,7 @@ use crate::colormap::{
     ColorMap, DisplayMode, InstFreqBaseline,
 };
 use crate::gpu::GpuContext;
-use crate::cwt::{CrossOutput, CwtEngine, CwtOutput};
+use crate::cwt::{synchrosqueeze, CrossOutput, CwtEngine, CwtOutput};
 use crate::wavelet::{CwtParams, WaveletKind};
 
 // ---------------------------------------------------------------------------
@@ -30,6 +30,8 @@ pub struct ComputeRequest {
     pub params:       CwtParams,
     pub antialias:    bool,
     pub unweighted:   bool,
+    /// Superlet order (extra sharpness passes); 1 = plain CWT.
+    pub superlet_order: u32,
 }
 
 pub enum WorkerResult {
@@ -141,6 +143,7 @@ pub struct WaveletApp {
     norm_captured: bool,   // frozen after first compute; no auto-rescale
     antialias:     bool,
     unweighted:    bool,   // unweighted Δφ estimator (see ExtractParams)
+    superlet_order: u32,   // passes in the Superlet view (cost ∝ order)
 
     // Worker thread communication
     work_tx:    mpsc::SyncSender<WorkerMsg>,
@@ -193,6 +196,7 @@ impl WaveletApp {
             norm_captured:   false,
             antialias:       true,
             unweighted:      false,
+            superlet_order:  3,
             work_tx,
             result_rx:       res_rx,
             computing:       false,
@@ -227,6 +231,12 @@ impl WaveletApp {
             params:       self.params.clone(),
             antialias:    self.antialias,
             unweighted:   self.unweighted,
+            // Extra superlet passes are paid only while the view needs them.
+            superlet_order: if self.display_mode == DisplayMode::Superlet {
+                self.superlet_order
+            } else {
+                1
+            },
         };
         let _ = self.work_tx.try_send(WorkerMsg::Compute(req));
         self.pending_compute_viewport = self.viewport.clone();
@@ -251,7 +261,8 @@ impl WaveletApp {
         // Phase hue must not be bilinearly blended (wraps +π/−π through the
         // whole wheel ⇒ false bands), so use NEAREST for phase-based views.
         let opts = match self.display_mode {
-            DisplayMode::Amplitude | DisplayMode::InstFreq => egui::TextureOptions::LINEAR,
+            DisplayMode::Amplitude | DisplayMode::InstFreq
+            | DisplayMode::Synchro | DisplayMode::Superlet => egui::TextureOptions::LINEAR,
             _                                              => egui::TextureOptions::NEAREST,
         };
 
@@ -282,6 +293,17 @@ impl WaveletApp {
                         self.instfreq_baseline, self.instfreq_range,
                         self.instfreq_detrend_win, vmin, vmax, self.log_amount,
                     ),
+                (DisplayMode::Synchro, _, _) if self.inst_devs.get(i).is_some() => {
+                    // Rows are log-spaced over [f_min, f_max] (see cwt.rs),
+                    // so the reassignment needs only ln(f_max/f_min).
+                    let log_ratio = (self.params.f_max / self.params.f_min).ln();
+                    let sq = synchrosqueeze(
+                        sc, &self.inst_devs[i], width, num_scales, log_ratio,
+                    );
+                    scalogram_to_rgba(
+                        &sq, width, num_scales, self.colormap, vmin, vmax, self.log_amount,
+                    )
+                }
                 _ =>
                     scalogram_to_rgba(sc, width, num_scales, self.colormap, vmin, vmax, self.log_amount),
             };
@@ -548,21 +570,39 @@ impl WaveletApp {
         let stereo = self.audio.as_ref().is_some_and(|a| a.channels.len() >= 2);
         let mut modes = vec![
             DisplayMode::Amplitude,
+            DisplayMode::Synchro,
+            DisplayMode::Superlet,
             DisplayMode::Phase,
             DisplayMode::Combined,
             DisplayMode::InstFreq,
         ];
         if stereo { modes.push(DisplayMode::CrossPhase); }
+        let prev_mode = self.display_mode;
+        let mut mode_changed = false;
         egui::ComboBox::from_label("Mode")
             .selected_text(self.display_mode.name())
             .show_ui(ui, |ui| {
                 for dm in modes {
-                    if ui.selectable_value(&mut self.display_mode, dm, dm.name()).changed() {
-                        let w = self.scalogram_width;
-                        if w > 0 { self.rebuild_textures(ctx); }
-                    }
+                    mode_changed |= ui
+                        .selectable_value(&mut self.display_mode, dm, dm.name())
+                        .changed();
                 }
             });
+        if mode_changed {
+            // Superlet amplitudes come from extra compute passes, so entering
+            // or leaving that view recomputes; any other switch re-renders.
+            let superlet_edge = (prev_mode == DisplayMode::Superlet)
+                != (self.display_mode == DisplayMode::Superlet);
+            if superlet_edge && self.audio.is_some() {
+                if self.computing {
+                    self.pending_compute = true;
+                } else {
+                    self.trigger_compute(self.last_width_px);
+                }
+            } else if self.scalogram_width > 0 {
+                self.rebuild_textures(ctx);
+            }
+        }
 
         egui::ComboBox::from_label("Colormap")
             .selected_text(self.colormap.name())
@@ -577,6 +617,21 @@ impl WaveletApp {
                     }
                 }
             });
+
+        if self.display_mode == DisplayMode::Superlet {
+            ui.label("Superlet order (CWT passes; sharpness ×1…×order):");
+            let mut o = self.superlet_order;
+            if ui.add(egui::Slider::new(&mut o, 2..=10).text("order")).changed() {
+                self.superlet_order = o;
+                if self.audio.is_some() {
+                    if self.computing {
+                        self.pending_compute = true;
+                    } else {
+                        self.trigger_compute(self.last_width_px);
+                    }
+                }
+            }
+        }
 
         if matches!(
             self.display_mode,
@@ -1347,7 +1402,7 @@ fn worker_thread(
                 // default; catch them so the UI reports instead of hanging in
                 // "Computing…" forever with a dead worker.
                 let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    engine.compute_all(
+                    engine.compute_all_superlet(
                         &req.channels,
                         req.sample_rate,
                         req.t_start,
@@ -1356,6 +1411,7 @@ fn worker_thread(
                         &req.params,
                         req.antialias,
                         req.unweighted,
+                        req.superlet_order,
                     )
                 }));
                 let result = match computed {

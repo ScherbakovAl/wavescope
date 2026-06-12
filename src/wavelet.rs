@@ -120,6 +120,26 @@ impl CwtParams {
         }
     }
 
+    /// Parameters of the k-th superlet pass (k ≥ 1): the family's
+    /// frequency-sharpness knob is scaled by k, mirroring multiplicative
+    /// superlets (Moca et al. 2021) where the k-th wavelet carries k·c₁
+    /// cycles. The generation kernel evaluates Morse/Paul in log space and
+    /// peaks at 1, so large scaled parameters stay numerically safe.
+    pub fn superlet_pass(&self, k: u32) -> CwtParams {
+        let k = k as f32;
+        let mut p = self.clone();
+        match self.kind {
+            WaveletKind::Morlet => {
+                p.omega0_low  *= k;
+                p.omega0_high *= k;
+            }
+            WaveletKind::Morse => p.morse_beta *= k,
+            WaveletKind::Bump  => p.bump_sigma /= k,
+            WaveletKind::Paul  => p.paul_order *= k,
+        }
+        p
+    }
+
     /// One-sided time support of the family in oscillation cycles, used to size
     /// the edge padding. Morlet returns 0 (its support is set by the existing
     /// scale-based rule); the broader families need extra room at f_min.

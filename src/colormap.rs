@@ -13,6 +13,16 @@ pub enum ColorMap {
 pub enum DisplayMode {
     /// Amplitude only, via the selected `ColorMap` (default).
     Amplitude,
+    /// Amplitude reassigned along the frequency axis to each pixel's
+    /// instantaneous frequency (pixel-level synchrosqueezing): ridges of
+    /// quasi-harmonic components collapse to ~1-row lines. Display-side only;
+    /// computed from the amplitude + inst-freq outputs already on hand.
+    Synchro,
+    /// Geometric mean of amplitudes over CWT passes with the wavelet's
+    /// frequency-sharpness parameter scaled ×1, ×2, … ×order (multiplicative
+    /// superlets, Moca et al. 2021) — sharper in both axes, costs `order`
+    /// compute passes.
+    Superlet,
     /// Phase only, via a cyclic hue colour wheel (minimal phase view).
     Phase,
     /// Phase as hue, amplitude as brightness (combined domain-colouring view).
@@ -30,6 +40,8 @@ impl DisplayMode {
     pub fn name(self) -> &'static str {
         match self {
             DisplayMode::Amplitude  => "Amplitude",
+            DisplayMode::Synchro    => "Synchrosqueezed",
+            DisplayMode::Superlet   => "Superlet",
             DisplayMode::Phase      => "Phase",
             DisplayMode::Combined   => "Phase+Amplitude",
             DisplayMode::InstFreq   => "Inst. frequency",

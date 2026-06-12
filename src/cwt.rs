@@ -218,6 +218,58 @@ impl CwtEngine {
         }
     }
 
+    /// Multiplicative superlets (Moca et al. 2021): the amplitude is replaced
+    /// by the geometric mean over `order` passes whose frequency-sharpness
+    /// parameter is scaled ×1, ×2, … ×order. Phase, coherence, inst-freq and
+    /// the cross spectrum come from the base (×1) pass. `order ≤ 1` is a
+    /// plain [`Self::compute_all`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_all_superlet(
+        &mut self,
+        channels:     &[Vec<f32>],
+        sample_rate:  u32,
+        t_start:      usize,
+        t_end:        usize,
+        width_pixels: usize,
+        params:       &CwtParams,
+        antialias:    bool,
+        unweighted:   bool,
+        order:        u32,
+    ) -> anyhow::Result<(Vec<CwtOutput>, Option<CrossOutput>)> {
+        let (mut outs, cross) = self.compute_all(
+            channels, sample_rate, t_start, t_end, width_pixels,
+            params, antialias, unweighted,
+        )?;
+        if order <= 1 {
+            return Ok((outs, cross));
+        }
+        // f64 accumulators: amplitudes span many decades and an f32 product
+        // of `order` of them underflows.
+        let mut prods: Vec<Vec<f64>> = outs
+            .iter()
+            .map(|(a, ..)| a.iter().map(|&v| v as f64).collect())
+            .collect();
+        for k in 2..=order {
+            let pk = params.superlet_pass(k);
+            let (outs_k, _) = self.compute_all(
+                channels, sample_rate, t_start, t_end, width_pixels,
+                &pk, antialias, unweighted,
+            )?;
+            for (prod, (a, ..)) in prods.iter_mut().zip(&outs_k) {
+                for (p, &v) in prod.iter_mut().zip(a) {
+                    *p *= v as f64;
+                }
+            }
+        }
+        let inv = 1.0 / order as f64;
+        for ((a, ..), prod) in outs.iter_mut().zip(prods) {
+            for (dst, p) in a.iter_mut().zip(prod) {
+                *dst = p.powf(inv) as f32;
+            }
+        }
+        Ok((outs, cross))
+    }
+
     /// Core pipeline for one or two signals (two ⇒ cross spectrum included).
     ///
     /// The visible window is processed in time chunks (each FFT capped at
@@ -482,6 +534,51 @@ impl CwtEngine {
 }
 
 // ---------------------------------------------------------------------------
+// Display-side synchrosqueezing
+// ---------------------------------------------------------------------------
+
+/// Pixel-level synchrosqueezing: reassign each pixel's amplitude along the
+/// frequency axis to the row matching its mean instantaneous frequency.
+/// Rows are log-spaced over `[f_min, f_max]`, so the shift depends only on
+/// the relative deviation: Δrow = (ns−1)·ln(1+dev)/`log_ratio`, where
+/// `log_ratio` = ln(f_max/f_min). The amplitude is split linearly between the
+/// two nearest rows; pixels whose target lies outside the grid are dropped
+/// (their energy belongs off-screen). Mass-preserving: ridges concentrate,
+/// so peak values grow — re-normalise brightness if they saturate.
+pub fn synchrosqueeze(
+    amp:        &[f32],
+    dev:        &[f32],
+    width:      usize,
+    num_scales: usize,
+    log_ratio:  f32,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; amp.len()];
+    let top = (num_scales - 1) as f32;
+    let rows_per_ln = top / log_ratio.max(1e-6);
+    for s in 0..num_scales {
+        for c in 0..width {
+            let i = s * width + c;
+            let a = amp[i];
+            if a <= 0.0 {
+                continue;
+            }
+            let t = s as f32 + (1.0 + dev[i]).max(1e-6).ln() * rows_per_ln;
+            // Also rejects NaN deviations.
+            if !(t >= 0.0 && t <= top) {
+                continue;
+            }
+            let r0 = t.floor() as usize;
+            let frac = t - r0 as f32;
+            out[r0 * width + c] += a * (1.0 - frac);
+            if r0 + 1 < num_scales {
+                out[(r0 + 1) * width + c] += a * frac;
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests. GPU tests self-skip when no adapter is available.
 // ---------------------------------------------------------------------------
 
@@ -512,6 +609,28 @@ mod tests {
         let g_stop = rms_mid(&stop) / r0;
         assert!((g_pass - 1.0).abs() < 0.01, "passband gain {g_pass}");
         assert!(g_stop < 0.01, "stopband gain {g_stop}");
+    }
+
+    /// CPU-only: a pixel whose instantaneous frequency sits exactly one
+    /// log-grid row above its own row must hand its amplitude to that row;
+    /// one whose target lies above the grid must be dropped.
+    #[test]
+    fn synchrosqueeze_reassigns_to_inst_freq_row() {
+        let ns = 4usize;
+        let width = 1usize;
+        let log_ratio = 0.3f32;                 // grid step δ = 0.1 per row
+        let delta = log_ratio / (ns - 1) as f32;
+
+        let mut amp = vec![0.0f32; ns];
+        let mut dev = vec![0.0f32; ns];
+        amp[1] = 1.0;
+        dev[1] = delta.exp() - 1.0;             // f_inst exactly one row up
+        amp[3] = 1.0;
+        dev[3] = (2.0 * delta).exp() - 1.0;     // target above the grid
+
+        let out = synchrosqueeze(&amp, &dev, width, ns, log_ratio);
+        assert!((out[2] - 1.0).abs() < 1e-4, "row 2 got {out:?}");
+        assert!(out[1].abs() < 1e-4 && out[3].abs() < 1e-4, "{out:?}");
     }
 
     macro_rules! engine_or_skip {
@@ -608,6 +727,57 @@ mod tests {
         let f_peak = row_freq(&params, ns, best);
         let rel = (f_peak - f0).abs() / f0;
         assert!(rel < 0.12, "peak row freq {f_peak:.1} Hz vs {f0} Hz (rel {rel:.3})");
+    }
+
+    /// A superlet must keep the tone's peak row and sharpen the frequency
+    /// profile (fewer rows above half-maximum) relative to the base pass.
+    #[test]
+    fn superlet_sharpens_tone_peak() {
+        let mut engine = engine_or_skip!();
+        let sr = 44_100u32;
+        let f0 = 2_000.0f64;
+        let n = 16_384usize;
+        let signal = tone(f0 / sr as f64, n);
+
+        let params = CwtParams {
+            num_scales: 96,
+            f_min: 500.0,
+            f_max: 8_000.0,
+            kind: WaveletKind::Morlet,
+            omega0_low: 6.0,
+            omega0_high: 6.0,
+            ..CwtParams::default()
+        };
+        let width = 16usize;
+        let ns = params.num_scales;
+
+        let rows_above_half = |scalo: &[f32]| {
+            let prof: Vec<f32> = (0..ns)
+                .map(|s| (0..width).map(|c| scalo[s * width + c]).sum())
+                .collect();
+            let max = prof.iter().cloned().fold(f32::MIN, f32::max);
+            prof.iter().filter(|&&v| v > max * 0.5).count()
+        };
+
+        let (base, _) = engine
+            .compute_all(
+                std::slice::from_ref(&signal), sr, 0, n, width, &params, false, false,
+            )
+            .expect("base compute failed");
+        let (sl, _) = engine
+            .compute_all_superlet(
+                std::slice::from_ref(&signal), sr, 0, n, width, &params, false, false, 3,
+            )
+            .expect("superlet compute failed");
+
+        let best = peak_row(&sl[0].0, ns, width);
+        let f_peak = row_freq(&params, ns, best);
+        let rel = (f_peak - f0).abs() / f0;
+        assert!(rel < 0.12, "peak row freq {f_peak:.1} Hz vs {f0} Hz (rel {rel:.3})");
+
+        let w_base = rows_above_half(&base[0].0);
+        let w_sl   = rows_above_half(&sl[0].0);
+        assert!(w_sl < w_base, "superlet width {w_sl} rows vs base {w_base}");
     }
 
     /// The instantaneous-frequency deviation must report exactly the offset
