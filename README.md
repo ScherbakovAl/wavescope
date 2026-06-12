@@ -6,7 +6,8 @@
 
 GPU-accelerated continuous-wavelet-transform (CWT) viewer for WAV/FLAC audio.
 Interactive scalogram with zoom/pan and amplitude / phase / instantaneous-frequency
-views.
+/ cross-channel-phase views, built for hunting subtle phase dynamics
+(oscillator synchronisation, frequency pulling, phase slips).
 
 Four analytic wavelet families to analyse with:
 
@@ -16,6 +17,31 @@ Four analytic wavelet families to analyse with:
 - **Bump** — compact in frequency ⇒ very sharp frequency lines, good for close
   stationary tones.
 - **Paul** — excellent time localisation ⇒ good for transients and onsets.
+
+## Phase analysis
+
+- **Inst. frequency view** — per-pixel relative deviation (f_inst − f_row)/f_row
+  on a diverging blue↔red map, with *nominal* or *detrended* baseline. The
+  estimator is arg Σ W(t+1)·W̄(t); an optional **unweighted** mode averages
+  unit-magnitude phase increments instead, so phase slips that coincide with
+  amplitude dips are not underweighted.
+- **Cross phase (L−R)** — for stereo files: hue = arg(W_L·W̄_R) (relative phase
+  between channels), saturation = cross-coherence, brightness = geometric-mean
+  amplitude. The canonical observable for synchronisation analysis.
+- **Ridge tracking & CSV export** — double-click a ridge to track it across the
+  view; export the trace (time, f_inst, amplitude, phase, coherence) as CSV.
+
+Processing is measurement-friendly by construction: L1-normalised wavelets
+(equal-amplitude tones are equally bright at any frequency and zoom),
+zero-phase half-band FIR decimation (flat passband, no phase distortion), and
+time-chunked compute so arbitrarily long files render in full within a bounded
+VRAM budget.
+
+## Controls
+
+- **Scroll** — zoom time axis · **Ctrl/Shift+Scroll** — zoom frequency axis
+- **Alt+Scroll** — pan time · **Drag** — pan
+- **Double-click** — pick a ridge · **Right-click** — reset view
 
 Cross-platform via [`wgpu`](https://github.com/gfx-rs/wgpu): compute runs on
 Vulkan (Linux/Windows), Metal (macOS) or DX12 (Windows), so it works on NVIDIA,
