@@ -18,6 +18,10 @@ pub enum DisplayMode {
     /// quasi-harmonic components collapse to ~1-row lines. Display-side only;
     /// computed from the amplitude + inst-freq outputs already on hand.
     Synchro,
+    /// Synchrosqueezed amplitude with the carrier phase reassigned alongside
+    /// it (complex accumulation): phase as hue, phase agreement of the
+    /// reassigned mass as saturation, squeezed amplitude as brightness.
+    SynchroPhase,
     /// Geometric mean of amplitudes over CWT passes with the wavelet's
     /// frequency-sharpness parameter scaled ×1, ×2, … ×order (multiplicative
     /// superlets, Moca et al. 2021) — sharper in both axes, costs `order`
@@ -41,6 +45,7 @@ impl DisplayMode {
         match self {
             DisplayMode::Amplitude  => "Amplitude",
             DisplayMode::Synchro    => "Synchrosqueezed",
+            DisplayMode::SynchroPhase => "Synchro+Phase",
             DisplayMode::Superlet   => "Superlet",
             DisplayMode::Phase      => "Phase",
             DisplayMode::Combined   => "Phase+Amplitude",

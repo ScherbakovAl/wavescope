@@ -578,6 +578,65 @@ pub fn synchrosqueeze(
     out
 }
 
+/// Phase-aware variant of [`synchrosqueeze`]: reassigns amplitude identically
+/// while also accumulating the complex sum Σ a·e^{iφ} per target pixel.
+/// Returns (amplitude, phase, coherence) where phase = arg(Σ a·e^{iφ}) and
+/// coherence = |Σ a·e^{iφ}| / Σa ∈ [0, 1] — the amplitude-weighted phase
+/// agreement of the mass that landed in the bin, so bins fed by pixels with
+/// conflicting phases desaturate in the combined view.
+pub fn synchrosqueeze_with_phase(
+    amp:        &[f32],
+    phase:      &[f32],
+    dev:        &[f32],
+    width:      usize,
+    num_scales: usize,
+    log_ratio:  f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut out_a  = vec![0.0f32; amp.len()];
+    let mut out_re = vec![0.0f32; amp.len()];
+    let mut out_im = vec![0.0f32; amp.len()];
+    let top = (num_scales - 1) as f32;
+    let rows_per_ln = top / log_ratio.max(1e-6);
+    for s in 0..num_scales {
+        for c in 0..width {
+            let i = s * width + c;
+            let a = amp[i];
+            if a <= 0.0 {
+                continue;
+            }
+            let t = s as f32 + (1.0 + dev[i]).max(1e-6).ln() * rows_per_ln;
+            // Also rejects NaN deviations.
+            if !(t >= 0.0 && t <= top) {
+                continue;
+            }
+            let (sin, cos) = phase[i].sin_cos();
+            let r0 = t.floor() as usize;
+            let frac = t - r0 as f32;
+            let j  = r0 * width + c;
+            let w0 = a * (1.0 - frac);
+            out_a[j]  += w0;
+            out_re[j] += w0 * cos;
+            out_im[j] += w0 * sin;
+            if r0 + 1 < num_scales {
+                let w1 = a * frac;
+                out_a[j + width]  += w1;
+                out_re[j + width] += w1 * cos;
+                out_im[j + width] += w1 * sin;
+            }
+        }
+    }
+    // Collapse the complex sums into phase / coherence in place
+    // (out_re becomes phase, out_im becomes coherence).
+    for i in 0..amp.len() {
+        let (re, im) = (out_re[i], out_im[i]);
+        if out_a[i] > 0.0 {
+            out_re[i] = im.atan2(re);
+            out_im[i] = (re.hypot(im) / out_a[i]).min(1.0);
+        }
+    }
+    (out_a, out_re, out_im)
+}
+
 // ---------------------------------------------------------------------------
 // Tests. GPU tests self-skip when no adapter is available.
 // ---------------------------------------------------------------------------
@@ -631,6 +690,39 @@ mod tests {
         let out = synchrosqueeze(&amp, &dev, width, ns, log_ratio);
         assert!((out[2] - 1.0).abs() < 1e-4, "row 2 got {out:?}");
         assert!(out[1].abs() < 1e-4 && out[3].abs() < 1e-4, "{out:?}");
+    }
+
+    /// CPU-only: the phase-aware variant must carry the source phase to the
+    /// target row with full coherence when contributors agree, and cancel
+    /// the coherence (amplitude intact) when opposite phases share a bin.
+    #[test]
+    fn synchrosqueeze_with_phase_carries_and_cancels() {
+        let ns = 4usize;
+        let width = 1usize;
+        let log_ratio = 0.3f32;
+        let delta = log_ratio / (ns - 1) as f32;
+
+        // Rows 1 and 3 both target row 2 (one row up / one row down).
+        let mut amp = vec![0.0f32; ns];
+        let mut dev = vec![0.0f32; ns];
+        let mut ph  = vec![0.0f32; ns];
+        amp[1] = 1.0;
+        dev[1] = delta.exp() - 1.0;
+        ph[1]  = 1.0;
+        amp[3] = 1.0;
+        dev[3] = (-delta).exp() - 1.0;
+        ph[3]  = 1.0;
+
+        let (a, p, c) = synchrosqueeze_with_phase(&amp, &ph, &dev, width, ns, log_ratio);
+        assert!((a[2] - 2.0).abs() < 1e-4, "amp {a:?}");
+        assert!((p[2] - 1.0).abs() < 1e-4, "phase {p:?}");
+        assert!((c[2] - 1.0).abs() < 1e-4, "coherence {c:?}");
+
+        // Opposite phases: amplitude still adds, complex sum cancels.
+        ph[3] = 1.0 - std::f32::consts::PI;
+        let (a, _, c) = synchrosqueeze_with_phase(&amp, &ph, &dev, width, ns, log_ratio);
+        assert!((a[2] - 2.0).abs() < 1e-4, "amp {a:?}");
+        assert!(c[2].abs() < 1e-4, "coherence {c:?}");
     }
 
     macro_rules! engine_or_skip {

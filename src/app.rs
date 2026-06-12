@@ -9,7 +9,7 @@ use crate::colormap::{
     ColorMap, DisplayMode, InstFreqBaseline,
 };
 use crate::gpu::GpuContext;
-use crate::cwt::{synchrosqueeze, CrossOutput, CwtEngine, CwtOutput};
+use crate::cwt::{synchrosqueeze, synchrosqueeze_with_phase, CrossOutput, CwtEngine, CwtOutput};
 use crate::wavelet::{CwtParams, WaveletKind};
 
 // ---------------------------------------------------------------------------
@@ -304,6 +304,16 @@ impl WaveletApp {
                         &sq, width, num_scales, self.colormap, vmin, vmax, self.log_amount,
                     )
                 }
+                (DisplayMode::SynchroPhase, Some(ph), _) if self.inst_devs.get(i).is_some() => {
+                    let log_ratio = (self.params.f_max / self.params.f_min).ln();
+                    let (sq, sph, sco) = synchrosqueeze_with_phase(
+                        sc, ph, &self.inst_devs[i], width, num_scales, log_ratio,
+                    );
+                    combined_to_rgba(
+                        &sq, &sph, &sco, width, num_scales,
+                        vmin, vmax, self.log_amount, self.phase_gamma,
+                    )
+                }
                 _ =>
                     scalogram_to_rgba(sc, width, num_scales, self.colormap, vmin, vmax, self.log_amount),
             };
@@ -571,6 +581,7 @@ impl WaveletApp {
         let mut modes = vec![
             DisplayMode::Amplitude,
             DisplayMode::Synchro,
+            DisplayMode::SynchroPhase,
             DisplayMode::Superlet,
             DisplayMode::Phase,
             DisplayMode::Combined,
@@ -636,6 +647,7 @@ impl WaveletApp {
         if matches!(
             self.display_mode,
             DisplayMode::Phase | DisplayMode::Combined | DisplayMode::CrossPhase
+            | DisplayMode::SynchroPhase
         ) {
             ui.label("Phase coherence γ (fade unresolved phase):");
             if ui.add(

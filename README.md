@@ -24,6 +24,9 @@ Four analytic wavelet families to analyse with:
 - **Synchrosqueezed** — amplitude reassigned along the frequency axis to each
   pixel's instantaneous frequency: ridges of quasi-harmonic components
   collapse to ~1-row lines. Display-side post-processing, no extra compute.
+- **Synchro+Phase** — same reassignment with the carrier phase carried along
+  as a complex sum Σ a·e^{iφ}: hue = reassigned phase, saturation = phase
+  agreement of the mass landing in the bin, brightness = squeezed amplitude.
 - **Superlet** — geometric mean of amplitudes over CWT passes with the
   wavelet's frequency-sharpness parameter scaled ×1…×order (multiplicative
   superlets, Moca et al. 2021). Sharper in both axes; costs *order* compute
