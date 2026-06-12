@@ -8,5 +8,5 @@ type: software
 repository-code: "https://github.com/ScherbakovAl/wavescope"
 license: MIT
 doi: 10.5281/zenodo.20573387
-version: 0.1.3
-date-released: 2026-06-07
+version: 0.2.0
+date-released: 2026-06-12

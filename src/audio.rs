@@ -1,11 +1,13 @@
 use std::path::Path;
+use std::sync::Arc;
 use anyhow::Context;
 
 /// Loaded audio file with samples normalised to [-1, 1].
 pub struct AudioFile {
     pub sample_rate: u32,
     /// One Vec<f32> per channel, interleaved samples split into channels.
-    pub channels: Vec<Vec<f32>>,
+    /// Shared via `Arc` so compute requests don't copy the audio data.
+    pub channels: Arc<Vec<Vec<f32>>>,
     pub duration_secs: f32,
     pub path: String,
 }
@@ -92,7 +94,7 @@ impl AudioFile {
         let duration_secs = num_frames as f32 / sample_rate as f32;
         Ok(AudioFile {
             sample_rate,
-            channels,
+            channels: Arc::new(channels),
             duration_secs,
             path: path.to_string_lossy().into_owned(),
         })

@@ -31,11 +31,14 @@ pub struct RcParams {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct WavParams {
     pub n: u32,
+    /// Rows in this scale batch.
     pub num_scales: u32,
+    /// First global scale row of the batch (indexes `scales` / `eta`).
+    pub scale_offset: u32,
     pub kind: u32,
     pub p1: f32,
     pub p2: f32,
-    pub _pad: [u32; 3],
+    pub _pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -46,15 +49,34 @@ pub struct MulParams {
     pub _pad: [u32; 2],
 }
 
+/// Shared by the per-channel `extract` and the `cross_extract` kernels.
+/// Columns are addressed globally: column `col` covers tape (downsampled
+/// signal) samples `[bounds[col], bounds[col+1])`; the chunk currently on the
+/// GPU holds tape samples `[chunk_lo, chunk_lo + chunk_len)`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct ExtractParams {
     pub n: u32,
-    pub num_scales: u32,
-    pub valid_start: i32,
-    pub valid_end: i32,
+    /// Rows in this scale batch.
+    pub rows: u32,
+    /// First global scale row of the batch.
+    pub scale_offset: u32,
+    /// Full output width in pixels (output stride).
     pub width: u32,
-    pub _pad: [u32; 3],
+    /// First global column handled by this dispatch.
+    pub col_start: u32,
+    /// Number of columns handled by this dispatch.
+    pub col_count: u32,
+    /// Tape sample index of the chunk's first sample.
+    pub chunk_lo: i32,
+    /// Number of real samples uploaded for this chunk (≤ n).
+    pub chunk_len: i32,
+    /// Chunk-local end of the valid (non-padding) region.
+    pub valid_end: i32,
+    /// 1 ⇒ unweighted Δφ estimator (each phase increment normalised to unit
+    /// magnitude before averaging); 0 ⇒ amplitude²-weighted (default).
+    pub unit_weight: u32,
+    pub _pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -90,6 +112,7 @@ pub struct GpuContext {
     pub p_wavelet: Pipeline,
     pub p_multiply: Pipeline,
     pub p_extract: Pipeline,
+    pub p_cross: Pipeline,
     pub p_fft: Pipeline,
 }
 
@@ -173,6 +196,21 @@ impl GpuContext {
                 Bind::StorageWrite, // inst_dev
                 Bind::StorageRead,  // scales
                 Bind::StorageRead,  // eta
+                Bind::StorageRead,  // column bounds
+                Bind::Uniform,
+            ],
+        );
+        let p_cross = build_pipeline(
+            &device,
+            "cross_extract",
+            SRC_CROSS_EXTRACT,
+            &[
+                Bind::StorageRead,  // cwt channel 0
+                Bind::StorageRead,  // cwt channel 1
+                Bind::StorageWrite, // phase difference
+                Bind::StorageWrite, // cross coherence
+                Bind::StorageWrite, // geometric-mean amplitude
+                Bind::StorageRead,  // column bounds
                 Bind::Uniform,
             ],
         );
@@ -190,6 +228,7 @@ impl GpuContext {
             p_wavelet,
             p_multiply,
             p_extract,
+            p_cross,
             p_fft,
         })
     }
@@ -327,18 +366,48 @@ impl GpuContext {
         instdev: &wgpu::Buffer,
         scales: &wgpu::Buffer,
         eta: &wgpu::Buffer,
+        bounds: &wgpu::Buffer,
         params: ExtractParams,
     ) {
         let ub = self.uniform(bytemuck::bytes_of(&params));
         let bg = self.bind(
             &self.p_extract.layout,
-            &[cwt, scalo, phase, coher, instdev, scales, eta, &ub],
+            &[cwt, scalo, phase, coher, instdev, scales, eta, bounds, &ub],
         );
         self.pass(
             enc,
             &self.p_extract,
             &bg,
-            (ceil_div(params.width, WG), params.num_scales, 1),
+            (ceil_div(params.col_count, WG), params.rows, 1),
+        );
+    }
+
+    /// Cross-channel wavelet spectrum per pixel: phase difference
+    /// arg(Σ W₀·W̄₁), cross-coherence |Σ W₀·W̄₁| / Σ|W₀||W₁| and the
+    /// geometric-mean amplitude — exposes the relative phase between the two
+    /// channels (the canonical synchronisation observable).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cross_extract(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        cwt0: &wgpu::Buffer,
+        cwt1: &wgpu::Buffer,
+        phase: &wgpu::Buffer,
+        coher: &wgpu::Buffer,
+        amp: &wgpu::Buffer,
+        bounds: &wgpu::Buffer,
+        params: ExtractParams,
+    ) {
+        let ub = self.uniform(bytemuck::bytes_of(&params));
+        let bg = self.bind(
+            &self.p_cross.layout,
+            &[cwt0, cwt1, phase, coher, amp, bounds, &ub],
+        );
+        self.pass(
+            enc,
+            &self.p_cross,
+            &bg,
+            (ceil_div(params.col_count, WG), params.rows, 1),
         );
     }
 
@@ -468,7 +537,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const SRC_WAVELET: &str = r#"
-struct P { n: u32, num_scales: u32, kind: u32, p1: f32, p2: f32 };
+struct P { n: u32, num_scales: u32, scale_offset: u32, kind: u32, p1: f32, p2: f32 };
 @group(0) @binding(0) var<storage, read_write> wfreqs: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read>       scales: array<f32>;
 @group(0) @binding(2) var<storage, read>       eta:    array<f32>;
@@ -476,13 +545,17 @@ struct P { n: u32, num_scales: u32, kind: u32, p1: f32, p2: f32 };
 
 const PI: f32 = 3.141592653589793;
 
+// All families are L1-normalised: ψ̂ peaks at exactly 1, with no √s factor.
+// A unit-amplitude sinusoid then lights its ridge with |W| = 0.5 regardless
+// of frequency, zoom or decimation — amplitude-faithful across the band.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = gid.x;
     let s = gid.y;
     if (k >= p.n || s >= p.num_scales) { return; }
 
-    let scale = scales[s];
+    let srow  = p.scale_offset + s;
+    let scale = scales[srow];
     let N = f32(p.n);
     var omega: f32;
     if (k <= p.n / 2u) {
@@ -492,34 +565,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let w  = scale * omega;
-    let sq = sqrt(scale);
     var val = 0.0;
 
     if (w > 0.0) {
         switch p.kind {
             case 0u: {   // Morlet
-                let diff = w - eta[s];
-                val = pow(PI, -0.25) * sqrt(2.0 * PI) * sq * exp(-0.5 * diff * diff);
+                let diff = w - eta[srow];
+                val = exp(-0.5 * diff * diff);
             }
             case 1u: {   // Generalized Morse
                 let beta  = p.p1;
                 let gamma = p.p2;
                 let wpeak = pow(beta / gamma, 1.0 / gamma);
                 let lg = beta * log(w / wpeak) - pow(w, gamma) + beta / gamma;
-                val = sq * exp(lg);
+                val = exp(lg);
             }
             case 2u: {   // Bump
-                let mu    = eta[s];
+                let mu    = eta[srow];
                 let sigma = p.p1;
                 let x = (w - mu) / sigma;
                 if (x > -1.0 && x < 1.0) {
-                    val = sq * exp(1.0 - 1.0 / (1.0 - x * x));
+                    val = exp(1.0 - 1.0 / (1.0 - x * x));
                 }
             }
             case 3u: {   // Paul
                 let m = p.p1;
                 let lg = m * log(w / m) - w + m;
-                val = sq * exp(lg);
+                val = exp(lg);
             }
             default: { }
         }
@@ -583,7 +655,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const SRC_EXTRACT: &str = r#"
-struct P { n: u32, num_scales: u32, valid_start: i32, valid_end: i32, width: u32 };
+struct P {
+    n: u32, rows: u32, scale_offset: u32, width: u32,
+    col_start: u32, col_count: u32,
+    chunk_lo: i32, chunk_len: i32, valid_end: i32,
+    unit_weight: u32,
+};
 @group(0) @binding(0) var<storage, read>       cwt:     array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read_write> scalo:   array<f32>;
 @group(0) @binding(2) var<storage, read_write> phase:   array<f32>;
@@ -591,7 +668,8 @@ struct P { n: u32, num_scales: u32, valid_start: i32, valid_end: i32, width: u32
 @group(0) @binding(4) var<storage, read_write> instdev: array<f32>;
 @group(0) @binding(5) var<storage, read>       scales:  array<f32>;
 @group(0) @binding(6) var<storage, read>       eta:     array<f32>;
-@group(0) @binding(7) var<uniform>             p:       P;
+@group(0) @binding(7) var<storage, read>       bounds:  array<u32>;
+@group(0) @binding(8) var<uniform>             p:       P;
 
 fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
@@ -600,26 +678,30 @@ fn cconj(a: vec2<f32>) -> vec2<f32> { return vec2<f32>(a.x, -a.y); }
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let col = gid.x;
-    let s   = gid.y;
-    if (col >= p.width || s >= p.num_scales) { return; }
+    let ci = gid.x;
+    let s  = gid.y;
+    if (ci >= p.col_count || s >= p.rows) { return; }
+    let col  = p.col_start + ci;
+    let srow = p.scale_offset + s;
 
-    let outidx = s * p.width + col;
+    let outidx = srow * p.width + col;
     let Ni = i32(p.n);
-    let valid_len = p.valid_end - p.valid_start;
 
-    var samp_start = p.valid_start + i32(f32(col)        * f32(valid_len) / f32(p.width));
-    var samp_end   = p.valid_start + i32(f32(col + 1u)   * f32(valid_len) / f32(p.width));
+    // Exact column → tape-sample bounds (integer, computed on the CPU),
+    // translated to chunk-local indices.
+    var samp_start = i32(bounds[col])      - p.chunk_lo;
+    var samp_end   = i32(bounds[col + 1u]) - p.chunk_lo;
     if (samp_end > p.valid_end) { samp_end = p.valid_end; }
     if (samp_end > Ni)          { samp_end = Ni; }
-    if (samp_start >= Ni) {
+    if (samp_start < 0)         { samp_start = 0; }
+    if (samp_end <= samp_start) { samp_end = samp_start + 1; }
+    if (samp_start >= Ni || samp_start >= p.valid_end) {
         scalo[outidx]   = 0.0;
         phase[outidx]   = 0.0;
         coher[outidx]   = 0.0;
         instdev[outidx] = 0.0;
         return;
     }
-    if (samp_end <= samp_start) { samp_end = samp_start + 1; }
     let count = samp_end - samp_start;
 
     var sum = 0.0;
@@ -633,9 +715,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         sum += length(c);
         sre += c.x;
         sim += c.y;
-        if (t + 1 < Ni) {
+        // Phase increment to the next sample; t+1 stays inside the chunk's
+        // real data (padding region holds real signal, so pairs may cross
+        // the column / chunk-valid boundary).
+        if (t + 1 < p.chunk_len) {
             let cn = cwt[row_off + u32(t + 1)];
-            acc += cmul(cn, cconj(c));
+            var z = cmul(cn, cconj(c));
+            if (p.unit_weight == 1u) {
+                let l = length(z);
+                if (l > 0.0) { z = z / l; } else { z = vec2<f32>(0.0, 0.0); }
+            }
+            acc += z;
         }
     }
 
@@ -644,8 +734,73 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let mag = sqrt(sre * sre + sim * sim);
     coher[outidx] = select(0.0, mag / sum, sum > 0.0);
     let dphi  = atan2(acc.y, acc.x);
-    let eta_s = eta[s];
-    instdev[outidx] = select(0.0, dphi * scales[s] / eta_s - 1.0, eta_s > 0.0);
+    let eta_s = eta[srow];
+    instdev[outidx] = select(0.0, dphi * scales[srow] / eta_s - 1.0, eta_s > 0.0);
+}
+"#;
+
+const SRC_CROSS_EXTRACT: &str = r#"
+struct P {
+    n: u32, rows: u32, scale_offset: u32, width: u32,
+    col_start: u32, col_count: u32,
+    chunk_lo: i32, chunk_len: i32, valid_end: i32,
+    unit_weight: u32,
+};
+@group(0) @binding(0) var<storage, read>       cwt0:  array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read>       cwt1:  array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read_write> phase: array<f32>;
+@group(0) @binding(3) var<storage, read_write> coher: array<f32>;
+@group(0) @binding(4) var<storage, read_write> amp:   array<f32>;
+@group(0) @binding(5) var<storage, read>       bounds: array<u32>;
+@group(0) @binding(6) var<uniform>             p:     P;
+
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+fn cconj(a: vec2<f32>) -> vec2<f32> { return vec2<f32>(a.x, -a.y); }
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ci = gid.x;
+    let s  = gid.y;
+    if (ci >= p.col_count || s >= p.rows) { return; }
+    let col  = p.col_start + ci;
+    let srow = p.scale_offset + s;
+
+    let outidx = srow * p.width + col;
+    let Ni = i32(p.n);
+
+    var samp_start = i32(bounds[col])      - p.chunk_lo;
+    var samp_end   = i32(bounds[col + 1u]) - p.chunk_lo;
+    if (samp_end > p.valid_end) { samp_end = p.valid_end; }
+    if (samp_end > Ni)          { samp_end = Ni; }
+    if (samp_start < 0)         { samp_start = 0; }
+    if (samp_end <= samp_start) { samp_end = samp_start + 1; }
+    if (samp_start >= Ni || samp_start >= p.valid_end) {
+        phase[outidx] = 0.0;
+        coher[outidx] = 0.0;
+        amp[outidx]   = 0.0;
+        return;
+    }
+    let count = samp_end - samp_start;
+
+    var acc  = vec2<f32>(0.0, 0.0);   // Σ W0·conj(W1)
+    var wsum = 0.0;                   // Σ |W0|·|W1|
+    var asum = 0.0;                   // Σ sqrt(|W0|·|W1|)
+    let row_off = s * p.n;
+
+    for (var t = samp_start; t < samp_end; t = t + 1) {
+        let c0 = cwt0[row_off + u32(t)];
+        let c1 = cwt1[row_off + u32(t)];
+        acc += cmul(c0, cconj(c1));
+        let m = length(c0) * length(c1);
+        wsum += m;
+        asum += sqrt(m);
+    }
+
+    phase[outidx] = atan2(acc.y, acc.x);
+    coher[outidx] = select(0.0, length(acc) / wsum, wsum > 0.0);
+    amp[outidx]   = asum / (f32(p.n) * f32(count));
 }
 "#;
 

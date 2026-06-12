@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 use egui::TextureHandle;
 
@@ -9,7 +9,7 @@ use crate::colormap::{
     ColorMap, DisplayMode, InstFreqBaseline,
 };
 use crate::gpu::GpuContext;
-use crate::cwt::{CwtEngine, CwtOutput};
+use crate::cwt::{CrossOutput, CwtEngine, CwtOutput};
 use crate::wavelet::{CwtParams, WaveletKind};
 
 // ---------------------------------------------------------------------------
@@ -22,19 +22,34 @@ pub enum WorkerMsg {
 }
 
 pub struct ComputeRequest {
-    pub channels:     Vec<Vec<f32>>,
+    pub channels:     Arc<Vec<Vec<f32>>>,
     pub sample_rate:  u32,
     pub t_start:      usize,
     pub t_end:        usize,
     pub width_pixels: usize,
     pub params:       CwtParams,
     pub antialias:    bool,
+    pub unweighted:   bool,
 }
 
 pub enum WorkerResult {
     Loaded(AudioFile),
-    Computed(Vec<CwtOutput>),  // (amplitude, phase, coherence, inst_dev) per channel
+    Computed {
+        /// (amplitude, phase, coherence, inst_dev) per channel.
+        channels: Vec<CwtOutput>,
+        /// Cross spectrum of the first two channels (stereo input only).
+        cross: Option<CrossOutput>,
+    },
     Error(String),
+}
+
+/// Ridge seed picked by double-click, in physical coordinates so it survives
+/// pans / zooms / recomputes.
+#[derive(Clone, Copy)]
+struct RidgeSeed {
+    t_sec: f64,
+    f_hz:  f64,
+    ch:    usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -45,6 +60,20 @@ pub enum WorkerResult {
 pub struct Viewport {
     pub t_start: f64,   // visible window start in sample indices
     pub t_end:   f64,   // visible window end   in sample indices
+}
+
+/// Log-space frequency zoom around relative cursor height `ry` (0 = top).
+/// `zoom < 1` shrinks the range (zoom in). Returns the new (f_min, f_max).
+fn zoom_freq(ry: f64, zoom: f64, f_min: f64, f_max: f64) -> (f32, f32) {
+    let log_lo  = f_min.ln();
+    let log_hi  = f_max.ln();
+    let log_cur = log_hi - ry * (log_hi - log_lo);
+    let new_lo  = log_cur - (log_cur - log_lo) * zoom;
+    let new_hi  = log_cur + (log_hi - log_cur) * zoom;
+    let mut lo = (new_lo.exp() as f32).clamp(0.5, 20_000.0);
+    let hi = (new_hi.exp() as f32).clamp(1.0, 22_050.0);
+    if lo >= hi { lo = hi * 0.5; }
+    (lo, hi)
 }
 
 // What the user is currently dragging on the time scrollbar.
@@ -69,8 +98,13 @@ pub struct WaveletApp {
     phases:            Vec<Vec<f32>>,
     coherences:        Vec<Vec<f32>>,
     inst_devs:         Vec<Vec<f32>>,   // relative inst-freq deviation (f_inst−f_i)/f_i
+    cross:             Option<CrossOutput>, // L/R cross spectrum (stereo only)
     scalogram_width:   usize,
     textures:          Vec<Option<TextureHandle>>,
+
+    // Ridge tracking (double-click to pick, follows recomputes)
+    ridge_seed:        Option<RidgeSeed>,
+    ridge_rows:        Option<Vec<usize>>,  // scale row per column
 
     // Viewport & parameters
     viewport:     Viewport,         // currently shown (effective) time window
@@ -92,6 +126,7 @@ pub struct WaveletApp {
     data_max:      f32,
     norm_captured: bool,   // frozen after first compute; no auto-rescale
     antialias:     bool,
+    unweighted:    bool,   // unweighted Δφ estimator (see ExtractParams)
 
     // Worker thread communication
     work_tx:    mpsc::SyncSender<WorkerMsg>,
@@ -119,8 +154,11 @@ impl WaveletApp {
             phases:          Vec::new(),
             coherences:      Vec::new(),
             inst_devs:       Vec::new(),
+            cross:           None,
             scalogram_width: 0,
             textures:        Vec::new(),
+            ridge_seed:      None,
+            ridge_rows:      None,
             viewport:        Viewport { t_start: 0.0, t_end: 1.0 },
             tex_viewport:    Viewport { t_start: 0.0, t_end: 1.0 },
             pending_compute_viewport: Viewport { t_start: 0.0, t_end: 1.0 },
@@ -140,6 +178,7 @@ impl WaveletApp {
             data_max:        1.0,
             norm_captured:   false,
             antialias:       true,
+            unweighted:      false,
             work_tx,
             result_rx:       res_rx,
             computing:       false,
@@ -155,18 +194,25 @@ impl WaveletApp {
     // Trigger a compute with the current viewport / params
     // -----------------------------------------------------------------------
     fn trigger_compute(&mut self, width_px: usize) {
-        let audio = match &self.audio { Some(a) => a, None => return };
+        let sr = match &self.audio { Some(a) => a.sample_rate, None => return };
+        // Keep f_max safely below Nyquist so the computed rows match the
+        // labelled f_min..f_max axis exactly (no silent f_max_eff clamp).
+        let nyq_cap = sr as f32 * 0.49;
+        self.params.f_max = self.params.f_max.min(nyq_cap).max(2.0);
+        self.params.f_min = self.params.f_min.min(self.params.f_max * 0.99);
+        let audio = self.audio.as_ref().unwrap();
         let t0 = self.viewport.t_start as usize;
         let t1 = (self.viewport.t_end as usize).min(audio.num_samples());
         if t0 >= t1 { return; }
         let req = ComputeRequest {
-            channels:     audio.channels.clone(),
+            channels:     audio.channels.clone(),   // Arc: no data copy
             sample_rate:  audio.sample_rate,
             t_start:      t0,
             t_end:        t1,
             width_pixels: width_px,
             params:       self.params.clone(),
             antialias:    self.antialias,
+            unweighted:   self.unweighted,
         };
         let _ = self.work_tx.try_send(WorkerMsg::Compute(req));
         self.pending_compute_viewport = self.viewport.clone();
@@ -178,11 +224,36 @@ impl WaveletApp {
     // -----------------------------------------------------------------------
     // Rebuild egui textures from scalogram data
     // -----------------------------------------------------------------------
+    /// True when the cross-phase view is selected and cross data exists.
+    fn cross_active(&self) -> bool {
+        self.display_mode == DisplayMode::CrossPhase && self.cross.is_some()
+    }
+
     fn rebuild_textures(&mut self, ctx: &egui::Context) {
         let width = self.scalogram_width;
         self.textures.clear();
         if width == 0 { return; }
         let (vmin, vmax) = (self.vmin, self.vmax);
+        // Phase hue must not be bilinearly blended (wraps +π/−π through the
+        // whole wheel ⇒ false bands), so use NEAREST for phase-based views.
+        let opts = match self.display_mode {
+            DisplayMode::Amplitude | DisplayMode::InstFreq => egui::TextureOptions::LINEAR,
+            _                                              => egui::TextureOptions::NEAREST,
+        };
+
+        if self.cross_active() {
+            let cr = self.cross.as_ref().unwrap();
+            let num_scales = cr.phase.len() / width;
+            if num_scales == 0 { return; }
+            let rgba = combined_to_rgba(
+                &cr.amplitude, &cr.phase, &cr.coherence, width, num_scales,
+                vmin, vmax, self.log_amount, self.phase_gamma,
+            );
+            let img = egui::ColorImage::from_rgba_unmultiplied([width, num_scales], &rgba);
+            self.textures.push(Some(ctx.load_texture("scalogram", img, opts)));
+            return;
+        }
+
         for (i, sc) in self.scalograms.iter().enumerate() {
             let num_scales = sc.len() / width;
             if num_scales == 0 { continue; }
@@ -201,12 +272,6 @@ impl WaveletApp {
                     scalogram_to_rgba(sc, width, num_scales, self.colormap, vmin, vmax, self.log_amount),
             };
             let img  = egui::ColorImage::from_rgba_unmultiplied([width, num_scales], &rgba);
-            // Phase hue must not be bilinearly blended (wraps +π/−π through the
-            // whole wheel ⇒ false bands), so use NEAREST for phase-based views.
-            let opts = match self.display_mode {
-                DisplayMode::Amplitude | DisplayMode::InstFreq => egui::TextureOptions::LINEAR,
-                _                                              => egui::TextureOptions::NEAREST,
-            };
             let tex  = ctx.load_texture("scalogram", img, opts);
             self.textures.push(Some(tex));
         }
@@ -238,6 +303,110 @@ impl WaveletApp {
         self.data_max = hi;
         self.vmin     = lo;
         self.vmax     = hi;
+    }
+
+    // -----------------------------------------------------------------------
+    // Ridge tracking & export
+    // -----------------------------------------------------------------------
+
+    /// (Re)extract the ridge from the current scalogram data: greedy
+    /// local-maximum tracking from the seed, ±2 rows per column step.
+    /// Cleared when the seed lies outside the computed window.
+    fn update_ridge(&mut self) {
+        self.ridge_rows = None;
+        let Some(seed) = self.ridge_seed else { return };
+        let Some(audio) = &self.audio else { return };
+        let width = self.scalogram_width;
+        if width == 0 { return; }
+        let Some(amp) = self.scalograms.get(seed.ch) else { return };
+        let ns = amp.len() / width;
+        if ns < 2 { return; }
+        let sr   = audio.sample_rate as f64;
+        let vp   = &self.tex_viewport;
+        let span = vp.t_end - vp.t_start;
+        if span <= 0.0 { return; }
+        let colf = (seed.t_sec * sr - vp.t_start) / span * width as f64;
+        if colf < 0.0 || colf >= width as f64 { return; }
+        let col0 = colf as usize;
+        let lf0 = (self.params.f_min as f64).ln();
+        let lf1 = (self.params.f_max as f64).ln();
+        if lf1 <= lf0 { return; }
+        let row_guess = ((seed.f_hz.ln() - lf0) / (lf1 - lf0) * (ns - 1) as f64)
+            .round()
+            .clamp(0.0, (ns - 1) as f64) as usize;
+
+        let argmax = |col: usize, center: usize, radius: usize| -> usize {
+            let lo = center.saturating_sub(radius);
+            let hi = (center + radius).min(ns - 1);
+            (lo..=hi)
+                .max_by(|&a, &b| {
+                    amp[a * width + col]
+                        .partial_cmp(&amp[b * width + col])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(center)
+        };
+
+        let mut rows = vec![0usize; width];
+        let r0 = argmax(col0, row_guess, 3);
+        let mut r = r0;
+        for (col, slot) in rows.iter_mut().enumerate().skip(col0) {
+            r = argmax(col, r, 2);
+            *slot = r;
+        }
+        r = r0;
+        for (col, slot) in rows.iter_mut().enumerate().take(col0).rev() {
+            r = argmax(col, r, 2);
+            *slot = r;
+        }
+        self.ridge_rows = Some(rows);
+    }
+
+    /// Save the tracked ridge as CSV (one row per column of the current view).
+    fn export_ridge_csv(&mut self) {
+        let Some(seed) = self.ridge_seed else { return };
+        let Some(rows) = &self.ridge_rows else { return };
+        let Some(audio) = &self.audio else { return };
+        let width = self.scalogram_width;
+        if width == 0 || rows.len() != width { return; }
+        let (Some(amp), Some(ph), Some(co), Some(dev)) = (
+            self.scalograms.get(seed.ch),
+            self.phases.get(seed.ch),
+            self.coherences.get(seed.ch),
+            self.inst_devs.get(seed.ch),
+        ) else { return };
+        let ns = amp.len() / width;
+        if ns < 2 { return; }
+
+        let sr   = audio.sample_rate as f64;
+        let vp   = &self.tex_viewport;
+        let span = vp.t_end - vp.t_start;
+        let lf0  = (self.params.f_min as f64).ln();
+        let lf1  = (self.params.f_max as f64).ln();
+
+        let mut csv =
+            String::from("time_s,f_row_hz,f_inst_hz,rel_dev,amplitude,phase_rad,coherence\n");
+        for (col, &row) in rows.iter().enumerate() {
+            let t = (vp.t_start + (col as f64 + 0.5) / width as f64 * span) / sr;
+            let f_row = (lf0 + row as f64 / (ns - 1) as f64 * (lf1 - lf0)).exp();
+            let i = row * width + col;
+            let d = dev[i] as f64;
+            let f_inst = f_row * (1.0 + d);
+            csv.push_str(&format!(
+                "{t:.6},{f_row:.3},{f_inst:.3},{d:.6},{:.6},{:.4},{:.4}\n",
+                amp[i], ph[i], co[i],
+            ));
+        }
+
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name("ridge.csv")
+            .save_file()
+        {
+            match std::fs::write(&path, csv) {
+                Ok(())  => self.status = format!("Ridge exported: {}", path.display()),
+                Err(e)  => self.error_msg = Some(format!("CSV write failed: {e}")),
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -362,15 +531,18 @@ impl WaveletApp {
         ui.separator();
         ui.heading("Display");
 
+        let stereo = self.audio.as_ref().is_some_and(|a| a.channels.len() >= 2);
+        let mut modes = vec![
+            DisplayMode::Amplitude,
+            DisplayMode::Phase,
+            DisplayMode::Combined,
+            DisplayMode::InstFreq,
+        ];
+        if stereo { modes.push(DisplayMode::CrossPhase); }
         egui::ComboBox::from_label("Mode")
             .selected_text(self.display_mode.name())
             .show_ui(ui, |ui| {
-                for dm in [
-                    DisplayMode::Amplitude,
-                    DisplayMode::Phase,
-                    DisplayMode::Combined,
-                    DisplayMode::InstFreq,
-                ] {
+                for dm in modes {
                     if ui.selectable_value(&mut self.display_mode, dm, dm.name()).changed() {
                         let w = self.scalogram_width;
                         if w > 0 { self.rebuild_textures(ctx); }
@@ -392,7 +564,10 @@ impl WaveletApp {
                 }
             });
 
-        if matches!(self.display_mode, DisplayMode::Phase | DisplayMode::Combined) {
+        if matches!(
+            self.display_mode,
+            DisplayMode::Phase | DisplayMode::Combined | DisplayMode::CrossPhase
+        ) {
             ui.label("Phase coherence γ (fade unresolved phase):");
             if ui.add(
                 egui::Slider::new(&mut self.phase_gamma, 0.0..=6.0).text("γ"),
@@ -433,6 +608,19 @@ impl WaveletApp {
                     self.instfreq_detrend_win = win as usize;
                     let w = self.scalogram_width;
                     if w > 0 { self.rebuild_textures(ctx); }
+                }
+            }
+
+            // Phase slips coincide with amplitude dips; the default estimator
+            // weights increments by |W|² and underweights exactly those
+            // moments. Unweighted = pure circular mean of Δφ.
+            if ui.checkbox(&mut self.unweighted, "Unweighted Δφ (slip-sensitive)")
+                .changed() && self.audio.is_some()
+            {
+                if self.computing {
+                    self.pending_compute = true;
+                } else {
+                    self.trigger_compute(self.last_width_px);
                 }
             }
         }
@@ -489,11 +677,34 @@ impl WaveletApp {
         }
 
         ui.separator();
+        ui.heading("Ridge");
+        if let Some(seed) = self.ridge_seed {
+            ui.label(format!("Seed: {:.3} s, {:.1} Hz (ch {})",
+                seed.t_sec, seed.f_hz, seed.ch + 1));
+            if self.ridge_rows.is_some() {
+                if ui.button("💾 Export ridge CSV…").clicked() {
+                    self.export_ridge_csv();
+                }
+            } else {
+                ui.label("(outside current view)");
+            }
+            if ui.button("✖ Clear ridge").clicked() {
+                self.ridge_seed = None;
+                self.ridge_rows = None;
+            }
+        } else {
+            ui.label("Double-click a ridge on the scalogram to track it; the trace \
+                      (t, f_inst, amplitude, phase) can then be exported as CSV.");
+        }
+
+        ui.separator();
         ui.label("Interactions:");
-        ui.label("Scroll         – zoom time axis");
-        ui.label("Shift+Scroll   – zoom freq axis");
-        ui.label("Drag           – pan");
-        ui.label("Right-click    – reset view");
+        ui.label("Scroll              – zoom time axis");
+        ui.label("Ctrl/Shift+Scroll   – zoom freq axis");
+        ui.label("Alt+Scroll          – pan time");
+        ui.label("Drag                – pan");
+        ui.label("Double-click        – pick ridge");
+        ui.label("Right-click         – reset view");
 
         // Status / spinner at bottom
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -534,8 +745,9 @@ impl WaveletApp {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     "Open a WAV or FLAC audio file to begin.\n\n\
-                     Scroll to zoom time • Ctrl+Scroll to zoom frequency\n\
-                     Drag to pan • Right-click to reset view",
+                     Scroll to zoom time • Ctrl/Shift+Scroll to zoom frequency\n\
+                     Alt+Scroll to pan • Drag to pan\n\
+                     Double-click to pick a ridge • Right-click to reset view",
                 );
             });
             return;
@@ -545,15 +757,16 @@ impl WaveletApp {
         let num_ch       = audio.channels.len();
         let total_samp   = audio.num_samples();
         let sr           = audio.sample_rate as f64;
-        let _num_scales  = self.params.num_scales;
         let f_min        = self.params.f_min as f64;
         let f_max        = self.params.f_max as f64;
+        let cross_active = self.cross_active();
+        let panels       = if cross_active { 1 } else { num_ch };
 
         // Reserve room at the bottom for the time scrollbar (height + spacing)
         // so it stays inside the window below the scalograms.
         let scrollbar_room = 44.0;
         let ch_height =
-            (((available.y - scrollbar_room) / num_ch.max(1) as f32) - 30.0).max(80.0);
+            (((available.y - scrollbar_room) / panels.max(1) as f32) - 30.0).max(80.0);
 
         self.hover_info = None;
         let mut viewport_changed = false;
@@ -569,11 +782,15 @@ impl WaveletApp {
         let mut new_f_min        = self.params.f_min;
         let mut new_f_max        = self.params.f_max;
 
-        for ch in 0..num_ch {
-            let label = match num_ch {
-                1 => "Mono".to_string(),
-                2 => if ch == 0 { "L".to_string() } else { "R".to_string() },
-                _ => format!("Ch {}", ch + 1),
+        for ch in 0..panels {
+            let label = if cross_active {
+                "Δφ L−R".to_string()
+            } else {
+                match num_ch {
+                    1 => "Mono".to_string(),
+                    2 => if ch == 0 { "L".to_string() } else { "R".to_string() },
+                    _ => format!("Ch {}", ch + 1),
+                }
             };
             ui.label(label);
 
@@ -613,6 +830,40 @@ impl WaveletApp {
                             ),
                             egui::Color32::WHITE,
                         );
+                    }
+                }
+            }
+
+            // Ridge overlay: drawn on the seed's channel panel (panel 0 in
+            // cross mode), shifted by the same pan offset as the texture.
+            if let (Some(seed), Some(rows)) = (self.ridge_seed, &self.ridge_rows) {
+                let on_this_panel = if cross_active { ch == 0 } else { ch == seed.ch };
+                if on_this_panel && self.scalogram_width > 0 {
+                    if let Some(sc) = self.scalograms.get(seed.ch) {
+                        let width = self.scalogram_width;
+                        let ns = sc.len() / width;
+                        if ns > 1 && rows.len() == width {
+                            let w   = rect.width();
+                            let off = (pan_dt / pan_len * w as f64) as f32;
+                            let pts: Vec<egui::Pos2> = rows
+                                .iter()
+                                .enumerate()
+                                .map(|(col, &row)| {
+                                    let x = rect.min.x
+                                        + (col as f32 + 0.5) / width as f32 * w + off;
+                                    let y = rect.min.y
+                                        + (1.0 - row as f32 / (ns - 1) as f32) * rect.height();
+                                    egui::pos2(x, y)
+                                })
+                                .filter(|p| p.x >= rect.min.x && p.x <= rect.max.x)
+                                .collect();
+                            if pts.len() > 1 {
+                                ui.painter().add(egui::Shape::line(
+                                    pts,
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 255, 255)),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -657,32 +908,69 @@ impl WaveletApp {
                     );
                 }
 
-                // Scroll: zoom time (plain) or frequency (Shift+scroll).
-                // NOTE: egui-winit converts Ctrl+Scroll into zoom_delta and
-                // zeros out scroll_delta, so we use Shift for freq zoom.
-                if response.hovered() {
-                    let (scroll, shift) =
-                        ctx.input(|i| (i.raw_scroll_delta, i.modifiers.shift));
+                // Double-click: pick a ridge seed at the cursor (time + freq).
+                if response.double_clicked() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let rx = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0) as f64;
+                        let ry = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0) as f64;
+                        let t_samp = new_viewport.t_start
+                            + rx * (new_viewport.t_end - new_viewport.t_start);
+                        let log_lo = f_min.ln();
+                        let log_hi = f_max.ln();
+                        let freq   = (log_hi - ry * (log_hi - log_lo)).exp();
+                        self.ridge_seed = Some(RidgeSeed {
+                            t_sec: t_samp / sr,
+                            f_hz:  freq,
+                            ch:    if cross_active { 0 } else { ch },
+                        });
+                        self.update_ridge();
+                    }
+                }
 
-                    if scroll.y.abs() > 0.5 {
+                // Scroll wheel:
+                //   plain        – zoom time axis around cursor
+                //   Ctrl (pinch) – zoom freq axis (egui-winit reports it as
+                //                  zoom_delta and zeros raw_scroll_delta)
+                //   Shift        – zoom freq axis
+                //   Alt / horizontal wheel – pan time
+                if response.hovered() {
+                    let (scroll, modifiers, zoomf) =
+                        ctx.input(|i| (i.raw_scroll_delta, i.modifiers, i.zoom_delta()));
+
+                    let ry = response
+                        .hover_pos()
+                        .map(|p| ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0) as f64)
+                        .unwrap_or(0.5);
+
+                    if (zoomf - 1.0).abs() > 1e-3 {
+                        // Ctrl+scroll / pinch: zoom frequency around cursor.
+                        let (lo, hi) = zoom_freq(ry, 1.0 / zoomf as f64, f_min, f_max);
+                        new_f_min = lo;
+                        new_f_max = hi;
+                        viewport_changed = true;
+                    }
+
+                    let pan_pts = if modifiers.alt { scroll.y } else { 0.0 } + scroll.x;
+                    if pan_pts.abs() > 0.5 {
+                        // Pan: one wheel notch (~50 pt) ≈ 10 % of the window.
+                        let len = new_viewport.t_end - new_viewport.t_start;
+                        let dt  = -(pan_pts as f64) * 0.002 * len;
+                        let mut ts = (new_viewport.t_start + dt).max(0.0);
+                        let mut te = ts + len;
+                        if te > total_samp as f64 {
+                            te = total_samp as f64;
+                            ts = (te - len).max(0.0);
+                        }
+                        new_viewport.t_start = ts;
+                        new_viewport.t_end   = te;
+                        viewport_changed = true;
+                    } else if scroll.y.abs() > 0.5 {
                         let zoom = if scroll.y > 0.0 { 0.85f64 } else { 1.0 / 0.85 };
 
-                        if shift {
-                            // Zoom frequency axis (log space) around cursor
-                            let ry = response
-                                .hover_pos()
-                                .map(|p| {
-                                    ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0) as f64
-                                })
-                                .unwrap_or(0.5);
-                            let log_lo  = f_min.ln();
-                            let log_hi  = f_max.ln();
-                            let log_cur = log_hi - ry * (log_hi - log_lo);
-                            let new_lo  = log_cur - (log_cur - log_lo) * zoom;
-                            let new_hi  = log_cur + (log_hi - log_cur) * zoom;
-                            new_f_min = (new_lo.exp() as f32).clamp(0.5, 20_000.0);
-                            new_f_max = (new_hi.exp() as f32).clamp(1.0, 22_050.0);
-                            if new_f_min >= new_f_max { new_f_min = new_f_max * 0.5; }
+                        if modifiers.shift {
+                            let (lo, hi) = zoom_freq(ry, zoom, f_min, f_max);
+                            new_f_min = lo;
+                            new_f_max = hi;
                         } else {
                             // Zoom time axis around cursor
                             let rx = response
@@ -913,16 +1201,22 @@ impl eframe::App for WaveletApp {
                     self.tex_viewport = self.viewport.clone();
                     self.panning      = false;
                     self.params.f_min = 20.0;
-                    self.params.f_max = (audio.sample_rate as f32 / 2.0).min(20_000.0);
+                    self.params.f_max = (audio.sample_rate as f32 * 0.49).min(20_000.0);
                     self.textures = vec![None; audio.channels.len()];
                     self.scalograms.clear();
+                    self.cross         = None;
+                    self.ridge_seed    = None;
+                    self.ridge_rows    = None;
                     self.norm_captured = false;   // recapture brightness reference for new file
+                    if audio.channels.len() < 2 && self.display_mode == DisplayMode::CrossPhase {
+                        self.display_mode = DisplayMode::Amplitude;
+                    }
                     self.audio = Some(audio);
                     // Trigger initial compute
                     self.computing = false;
                     self.trigger_compute(self.last_width_px);
                 }
-                WorkerResult::Computed(results) => {
+                WorkerResult::Computed { channels: results, cross } => {
                     self.computing       = false;
                     // The new texture matches the window it was computed for;
                     // drop the pan offset so it snaps cleanly into place.
@@ -942,6 +1236,7 @@ impl eframe::App for WaveletApp {
                     self.phases          = phs;
                     self.coherences      = cohs;
                     self.inst_devs       = idevs;
+                    self.cross           = cross;
                     self.scalogram_width = self.last_width_px;
                     // Freeze the normalisation reference on the first compute
                     // after load; keep it stable across zoom / freq changes.
@@ -950,6 +1245,7 @@ impl eframe::App for WaveletApp {
                         self.norm_captured = true;
                     }
                     self.rebuild_textures(ctx);
+                    self.update_ridge();
                     self.status = "Ready.".into();
                     if self.pending_compute {
                         self.pending_compute = false;
@@ -1000,7 +1296,7 @@ fn worker_thread(
             return;
         }
     };
-    let engine = CwtEngine::new(gpu);
+    let mut engine = CwtEngine::new(gpu);
 
     for msg in rx.iter() {
         // For Compute messages, drain the queue and keep only the latest
@@ -1022,27 +1318,29 @@ fn worker_thread(
                 }
             }
             WorkerMsg::Compute(req) => {
-                let mut results = Vec::with_capacity(req.channels.len());
-                let mut err     = None;
-                for ch in &req.channels {
-                    match engine.compute(
-                        ch,
+                // wgpu turns device errors (e.g. out-of-memory) into panics by
+                // default; catch them so the UI reports instead of hanging in
+                // "Computing…" forever with a dead worker.
+                let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    engine.compute_all(
+                        &req.channels,
                         req.sample_rate,
                         req.t_start,
                         req.t_end,
                         req.width_pixels,
                         &req.params,
                         req.antialias,
-                    ) {
-                        Ok(s)  => results.push(s),
-                        Err(e) => { err = Some(e.to_string()); break; }
-                    }
-                }
-                if let Some(e) = err {
-                    let _ = tx.send(WorkerResult::Error(e));
-                } else {
-                    let _ = tx.send(WorkerResult::Computed(results));
-                }
+                        req.unweighted,
+                    )
+                }));
+                let result = match computed {
+                    Ok(Ok((channels, cross))) => WorkerResult::Computed { channels, cross },
+                    Ok(Err(e)) => WorkerResult::Error(e.to_string()),
+                    Err(_) => WorkerResult::Error(
+                        "GPU compute failed — try fewer scales or a smaller window".into(),
+                    ),
+                };
+                let _ = tx.send(result);
             }
         }
     }

@@ -20,15 +20,20 @@ pub enum DisplayMode {
     /// Instantaneous-frequency deviation as a diverging blue↔red map, amplitude
     /// as brightness — exposes phase "wobble" (pulling / slips) along a ridge.
     InstFreq,
+    /// Cross-channel phase difference φ₀−φ₁ as hue, cross-coherence as
+    /// saturation, geometric-mean amplitude as brightness — the relative
+    /// phase between the two channels (synchronisation observable).
+    CrossPhase,
 }
 
 impl DisplayMode {
     pub fn name(self) -> &'static str {
         match self {
-            DisplayMode::Amplitude => "Amplitude",
-            DisplayMode::Phase     => "Phase",
-            DisplayMode::Combined  => "Phase+Amplitude",
-            DisplayMode::InstFreq  => "Inst. frequency",
+            DisplayMode::Amplitude  => "Amplitude",
+            DisplayMode::Phase      => "Phase",
+            DisplayMode::Combined   => "Phase+Amplitude",
+            DisplayMode::InstFreq   => "Inst. frequency",
+            DisplayMode::CrossPhase => "Cross phase (L−R)",
         }
     }
 }
