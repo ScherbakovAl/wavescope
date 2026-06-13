@@ -9,6 +9,7 @@ hound = "3"
 claxon = "0.4"
 eframe = { version = "0.28", features = ["default"] }
 egui = "0.28"
+egui_plot = "0.28"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"

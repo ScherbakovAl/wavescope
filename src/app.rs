@@ -3,6 +3,7 @@ use std::sync::{mpsc, Arc};
 
 use egui::TextureHandle;
 
+use crate::analysis;
 use crate::audio::AudioFile;
 use crate::colormap::{
     combined_to_rgba, instfreq_to_rgba, phase_to_rgba, scalogram_to_rgba,
@@ -52,6 +53,15 @@ struct RidgeSeed {
     t_sec: f64,
     f_hz:  f64,
     ch:    usize,
+}
+
+/// Ridge trace reduced to the inputs the analysis metrics need.
+struct RidgeSeries {
+    t:     Vec<f64>,        // column time (seconds)
+    y:     Vec<f64>,        // fractional frequency (f_inst − f0)/f0
+    f0:    f64,             // window-mean instantaneous frequency (Hz)
+    tau0:  f64,             // column spacing (seconds)
+    dphi:  Option<Vec<f64>>, // L−R phase difference along the ridge (stereo only)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +131,7 @@ pub struct WaveletApp {
     // Ridge tracking (double-click to pick, follows recomputes)
     ridge_seed:        Option<RidgeSeed>,
     ridge_rows:        Option<Vec<usize>>,  // scale row per column
+    show_analysis:     bool,                // ridge-metrics window (Allan/O−C/Kuramoto)
 
     // Viewport & parameters
     viewport:     Viewport,         // currently shown (effective) time window
@@ -176,6 +187,7 @@ impl WaveletApp {
             textures:        Vec::new(),
             ridge_seed:      None,
             ridge_rows:      None,
+            show_analysis:   false,
             viewport:        Viewport { t_start: 0.0, t_end: 1.0 },
             tex_viewport:    Viewport { t_start: 0.0, t_end: 1.0 },
             pending_compute_viewport: Viewport { t_start: 0.0, t_end: 1.0 },
@@ -453,6 +465,133 @@ impl WaveletApp {
                 Err(e)  => self.error_msg = Some(format!("CSV write failed: {e}")),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ridge metrics (Allan / O−C / Kuramoto)
+    // -----------------------------------------------------------------------
+
+    /// Reduce the current-window ridge to the series the metrics consume:
+    /// fractional frequency y(t) relative to the window-mean carrier f0, and
+    /// (stereo only) the per-column L−R phase difference Δφ. Mirrors the
+    /// f_inst math in `export_ridge_csv`.
+    fn ridge_series(&self) -> Option<RidgeSeries> {
+        let seed  = self.ridge_seed?;
+        let rows  = self.ridge_rows.as_ref()?;
+        let audio = self.audio.as_ref()?;
+        let width = self.scalogram_width;
+        if width == 0 || rows.len() != width { return None; }
+        let amp = self.scalograms.get(seed.ch)?;
+        let dev = self.inst_devs.get(seed.ch)?;
+        let ns  = amp.len() / width;
+        if ns < 2 { return None; }
+
+        let sr   = audio.sample_rate as f64;
+        let vp   = &self.tex_viewport;
+        let span = vp.t_end - vp.t_start;
+        if span <= 0.0 { return None; }
+        let lf0  = (self.params.f_min as f64).ln();
+        let lf1  = (self.params.f_max as f64).ln();
+
+        let mut t      = Vec::with_capacity(width);
+        let mut f_inst = Vec::with_capacity(width);
+        for (col, &row) in rows.iter().enumerate() {
+            t.push((vp.t_start + (col as f64 + 0.5) / width as f64 * span) / sr);
+            let f_row = (lf0 + row as f64 / (ns - 1) as f64 * (lf1 - lf0)).exp();
+            f_inst.push(f_row * (1.0 + dev[row * width + col] as f64));
+        }
+        let f0 = f_inst.iter().sum::<f64>() / f_inst.len() as f64;
+        if f0 <= 0.0 { return None; }
+        let y: Vec<f64> = f_inst.iter().map(|f| (f - f0) / f0).collect();
+        // Uniform column spacing in seconds.
+        let tau0 = span / width as f64 / sr;
+
+        // Δφ = φ_L − φ_R sampled along the same ridge rows (stereo only).
+        let dphi = if audio.channels.len() >= 2 {
+            if let (Some(pl), Some(pr)) = (self.phases.first(), self.phases.get(1)) {
+                Some(rows.iter().enumerate().map(|(col, &row)| {
+                    let i = row * width + col;
+                    analysis::wrap_pi(pl[i] as f64 - pr[i] as f64)
+                }).collect())
+            } else { None }
+        } else { None };
+
+        Some(RidgeSeries { t, y, f0, tau0, dphi })
+    }
+
+    /// Floating window with the three ridge-derived diagnostics.
+    fn show_analysis_window(&mut self, ctx: &egui::Context) {
+        if !self.show_analysis { return; }
+        let series = self.ridge_series();
+        let mut open = self.show_analysis;
+        egui::Window::new("Ridge metrics")
+            .open(&mut open)
+            .default_width(560.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                let Some(s) = series else {
+                    ui.label("Pick a ridge in the current view to compute metrics.");
+                    return;
+                };
+                ui.label(format!(
+                    "Carrier f₀ = {:.3} Hz   ·   {} samples   ·   τ₀ = {:.3} ms",
+                    s.f0, s.t.len(), s.tau0 * 1e3,
+                ));
+                ui.separator();
+
+                use egui_plot::{Line, Plot, PlotPoints, Points};
+
+                // Allan deviation σ_y(τ): log-log, metrology-style.
+                ui.strong("Allan deviation σ_y(τ)  —  oscillator stability");
+                let adev = analysis::allan_deviation(&s.y, s.tau0);
+                let log_pairs: Vec<[f64; 2]> = adev.iter()
+                    .filter(|p| p[0] > 0.0 && p[1] > 0.0)
+                    .map(|p| [p[0].log10(), p[1].log10()])
+                    .collect();
+                Plot::new("allan")
+                    .height(150.0)
+                    .x_axis_label("log₁₀ τ [s]")
+                    .y_axis_label("log₁₀ σ_y")
+                    .show(ui, |p| {
+                        p.line(Line::new(PlotPoints::from(log_pairs.clone())).name("σ_y"));
+                        p.points(Points::new(PlotPoints::from(log_pairs.clone())).radius(3.0));
+                    });
+
+                ui.separator();
+
+                // O−C residual in carrier cycles vs time.
+                ui.strong("O−C residual  —  accumulated phase drift [cycles]");
+                let oc = analysis::oc_cycles(&s.y, s.f0, s.tau0);
+                let oc_pts: PlotPoints = s.t.iter().zip(&oc).map(|(&t, &v)| [t, v]).collect();
+                Plot::new("oc")
+                    .height(150.0)
+                    .x_axis_label("t [s]")
+                    .y_axis_label("O−C [cycles]")
+                    .show(ui, |p| { p.line(Line::new(oc_pts).name("O−C")); });
+
+                ui.separator();
+
+                // Kuramoto order parameter r(t) (L vs R, N = 2).
+                ui.strong("Kuramoto order parameter r(t)  —  L/R phase sync");
+                match &s.dphi {
+                    Some(dphi) => {
+                        let plv = analysis::mean_plv(dphi);
+                        ui.label(format!("mean PLV = {plv:.3}  (1 = steady lock, 0 = smeared)"));
+                        let r = analysis::kuramoto_r(dphi);
+                        let r_pts: PlotPoints =
+                            s.t.iter().zip(&r).map(|(&t, &v)| [t, v]).collect();
+                        Plot::new("kuramoto")
+                            .height(150.0)
+                            .x_axis_label("t [s]")
+                            .y_axis_label("r")
+                            .include_y(0.0)
+                            .include_y(1.0)
+                            .show(ui, |p| { p.line(Line::new(r_pts).name("r(t)")); });
+                    }
+                    None => { ui.label("Mono input — Kuramoto r(t) needs two channels."); }
+                }
+            });
+        self.show_analysis = open;
     }
 
     // -----------------------------------------------------------------------
@@ -764,6 +903,9 @@ impl WaveletApp {
             if self.ridge_rows.is_some() {
                 if ui.button("💾 Export ridge CSV…").clicked() {
                     self.export_ridge_csv();
+                }
+                if ui.button("📈 Ridge metrics…").clicked() {
+                    self.show_analysis = true;
                 }
             } else {
                 ui.label("(outside current view)");
@@ -1366,6 +1508,8 @@ impl eframe::App for WaveletApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.show_scalograms(ui, ctx);
         });
+
+        self.show_analysis_window(ctx);
 
         if self.computing {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
